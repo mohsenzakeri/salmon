@@ -2,61 +2,75 @@
 #define __SALMON_UTILS_HPP__
 
 extern "C" {
-#include "io_lib/scram.h"
 #include "io_lib/os.h"
+#include "io_lib/scram.h"
 #undef min
 #undef max
 }
 
 #include <algorithm>
-#include <iostream>
-#include <tuple>
-#include <unordered_set>
-#include <unordered_map>
-#include <memory>
-#include <vector>
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
+#include <iostream>
+#include <memory>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <Eigen/Dense>
 
+#include "cereal/archives/json.hpp"
 #include "spdlog/fmt/fmt.h"
 
-#include "SalmonOpts.hpp"
 #include "SalmonMath.hpp"
+#include "SalmonOpts.hpp"
 
-#include "LibraryFormat.hpp"
-#include "ReadLibrary.hpp"
-#include "TranscriptGeneMap.hpp"
 #include "GenomicFeature.hpp"
-#include "RapMapUtils.hpp"
+#include "LibraryFormat.hpp"
+#include "pufferfish/Util.hpp"
+#include "ReadLibrary.hpp"
+#include "SalmonConfig.hpp"
+#include "TranscriptGeneMap.hpp"
 
-class ReadExperiment;
+template <typename EqBuilderT> class ReadExperiment;
 class LibraryFormat;
 class FragmentLengthDistribution;
+class Transcript;
 
-namespace salmon{
+namespace salmon {
 namespace utils {
 
 using std::string;
 using NameVector = std::vector<string>;
 using IndexVector = std::vector<size_t>;
 using KmerVector = std::vector<uint64_t>;
-using MateStatus = rapmap::utils::MateStatus;
-    
+using MateStatus = pufferfish::util::MateStatus;
+
 // Keep track of the type of mapping that was obtained for this read
-enum class MappingType : uint8_t { 
-    UNMAPPED = 0, LEFT_ORPHAN = 1, RIGHT_ORPHAN = 2, BOTH_ORPHAN = 3, 
-        PAIRED_MAPPED = 4,  SINGLE_MAPPED = 5 };
+enum class MappingType : uint8_t {
+  UNMAPPED = 0,
+  LEFT_ORPHAN = 1,
+  RIGHT_ORPHAN = 2,
+  BOTH_ORPHAN = 3,
+  PAIRED_MAPPED = 4,
+  SINGLE_MAPPED = 5,
+  DECOY = 6
+};
+
+enum class DuplicateTargetStatus : uint8_t { 
+  UNKNOWN = 0, 
+  RETAINED_DUPLICATES = 1, 
+  REMOVED_DUPLICATES = 2 
+};
 
 std::string str(const MappingType& mt);
-
 
 // To keep track of short fragments (shorter than the k-mer length)
 // on which the index was built.
 struct ShortFragStats {
-    size_t numTooShort{0};
-    size_t shortest{std::numeric_limits<size_t>::max()};
+  size_t numTooShort{0};
+  size_t shortest{std::numeric_limits<size_t>::max()};
 };
 
 // An enum class for direction to avoid potential errors
@@ -80,31 +94,49 @@ uint32_t transcript(uint64_t enc);
 // offset --- lower 32-bits
 uint32_t offset(uint64_t enc);
 
-
 LibraryFormat parseLibraryFormatStringNew(std::string& fmt);
 
-std::vector<ReadLibrary> extractReadLibraries(boost::program_options::parsed_options& orderedOptions);
+std::vector<ReadLibrary>
+extractReadLibraries(boost::program_options::parsed_options& orderedOptions);
 
 LibraryFormat parseLibraryFormatString(std::string& fmt);
 
-  bool peekBAMIsPaired(const boost::filesystem::path& fname);
+bool peekBAMIsPaired(const boost::filesystem::path& fname);
 
-    
 size_t numberOfReadsInFastaFile(const std::string& fname);
 
-bool readKmerOrder( const std::string& fname, std::vector<uint64_t>& kmers );
+bool readKmerOrder(const std::string& fname, std::vector<uint64_t>& kmers);
 
-template <template<typename> class S, typename T>
-bool overlap( const S<T> &a, const S<T> &b );
+template <template <typename> class S, typename T>
+bool overlap(const S<T>& a, const S<T>& b);
 
-template< typename T >
-TranscriptGeneMap transcriptToGeneMapFromFeatures( std::vector<GenomicFeature<T>> &feats );
+template <typename T>
+TranscriptGeneMap
+transcriptToGeneMapFromFeatures(std::vector<GenomicFeature<T>>& feats);
 
-TranscriptGeneMap transcriptGeneMapFromGTF(const std::string& fname, std::string key="gene_id");
+TranscriptGeneMap transcriptGeneMapFromGTF(const std::string& fname,
+                                           std::string key = "gene_id");
 
-TranscriptGeneMap readTranscriptToGeneMap( std::ifstream &ifile );
+TranscriptGeneMap readTranscriptToGeneMap(std::ifstream& ifile);
 
-TranscriptGeneMap transcriptToGeneMapFromFasta( const std::string& transcriptsFile );
+TranscriptGeneMap
+transcriptToGeneMapFromFasta(const std::string& transcriptsFile);
+
+bool readEquivCounts(boost::filesystem::path& eqFilePathString,
+                     std::vector<string>& tnames,
+                     std::vector<double>& tlens,
+                     std::vector<std::vector<uint32_t>>& eqclasses,
+                     std::vector<std::vector<double>>& auxs_vals,
+                     std::vector<uint32_t>& eqclass_counts );
+
+/**
+ * @param sopt : The salmon options object that tells us the relevant files and contains the pointer 
+ *              to the logger object
+ * @param transcripts : The list of transcript objects
+ * 
+ * If the auxTargetFile is not empty (i.e. if the file exists)
+ **/
+void markAuxiliaryTargets(SalmonOpts& sopt, std::vector<Transcript>& transcripts);
 
 /*
 template <typename AbundanceVecT, typename ReadExpT>
@@ -113,155 +145,189 @@ Eigen::VectorXd updateEffectiveLengths(
         ReadExpT& readExp,
         Eigen::VectorXd& effLensIn,
         AbundanceVecT& alphas,
-	bool finalRound = false);
+    bool finalRound = false);
 */
 
 template <typename AbundanceVecT, typename ReadExpT>
-Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
-                                                      Eigen::VectorXd& effLensIn,
-                                                      AbundanceVecT& alphas, bool finalRound=false);
-
+Eigen::VectorXd
+updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
+                       Eigen::VectorXd& effLensIn, AbundanceVecT& alphas,
+                       std::vector<bool>& available, bool finalRound = false);
 
 /*
  * Use atomic compare-and-swap to update val to
  * val + inc (*in log-space*).  Update occurs in a loop in case other
  * threads update in the meantime.
  */
-inline void incLoopLog(tbb::atomic<double>& val, double inc) {
-	double oldMass = val.load();
-	double returnedMass = oldMass;
-	double newMass{salmon::math::LOG_0};
-	do {
-	  oldMass = returnedMass;
- 	  newMass = salmon::math::logAdd(oldMass, inc);
-	  returnedMass = val.compare_and_swap(newMass, oldMass);
-	} while (returnedMass != oldMass);
+inline void incLoopLog(std::atomic<double>& val, double inc) {
+  double oldMass = val.load();
+  double newMass;
+  do {
+    newMass = salmon::math::logAdd(oldMass, inc);
+  } while (! val.compare_exchange_strong(oldMass, newMass));
 }
-
 
 /*
  * Same as above, but overloaded for "plain" doubles
  */
-inline void incLoop(double& val, double inc) {
-	val += inc;
-}
-
+inline void incLoop(double& val, double inc) { val += inc; }
 
 /*
  * Use atomic compare-and-swap to update val to
  * val + inc.  Update occurs in a loop in case other
  * threads update in the meantime.
  */
-inline void incLoop(tbb::atomic<double>& val, double inc) {
-        double oldMass = val.load();
-        double returnedMass = oldMass;
-        double newMass{oldMass + inc};
-        do {
-            oldMass = returnedMass;
-            newMass = oldMass + inc;
-            returnedMass = val.compare_and_swap(newMass, oldMass);
-        } while (returnedMass != oldMass);
+
+inline void incLoop(std::atomic<double>& val, double inc) {
+  double oldMass = val.load();
+  double newMass;
+  do {
+    newMass = oldMass + inc;
+  } while (!val.compare_exchange_strong(oldMass, newMass));
 }
 
-bool processQuantOptions(SalmonOpts& sopt, boost::program_options::variables_map& vm, int32_t numBiasSamples);
+std::string getCurrentTimeAsString();
 
+bool validateOptionsAlignment_(SalmonOpts& sopt);
+bool validateOptionsMapping_(SalmonOpts& sopt);
 
+bool createAuxMapLoggers_(SalmonOpts& sopt,
+                          boost::program_options::variables_map& vm);
 
-void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm, boost::filesystem::path& inputPath);
+bool processQuantOptions(SalmonOpts& sopt,
+                         boost::program_options::variables_map& vm,
+                         int32_t numBiasSamples);
 
-// NOTE: Throws an invalid_argument exception of the quant or quant_bias_corrected files do
-// not exist!
+template <typename OrderedOptionsT>
+bool writeCmdInfo(SalmonOpts& sopt, OrderedOptionsT& orderedOptions) {
+  namespace bfs = boost::filesystem;
+  bfs::path cmdInfoPath = sopt.outputDirectory / "cmd_info.json";
+  std::ofstream os(cmdInfoPath.string());
+  cereal::JSONOutputArchive oa(os);
+  oa(cereal::make_nvp("salmon_version", std::string(salmon::version)));
+  for (auto& opt : orderedOptions.options) {
+    if (opt.value.size() == 1) {
+      oa(cereal::make_nvp(opt.string_key, opt.value.front()));
+    } else {
+      oa(cereal::make_nvp(opt.string_key, opt.value));
+    }
+  }
+  // explicitly ouput the aux directory as well
+  oa(cereal::make_nvp("auxDir", sopt.auxDir));
+  return true;
+}
+
+void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm,
+                                   boost::filesystem::path& inputPath);
+
+// NOTE: Throws an invalid_argument exception of the quant or
+// quant_bias_corrected files do not exist!
 void generateGeneLevelEstimates(boost::filesystem::path& geneMapPath,
                                 boost::filesystem::path& estDir);
 
-    enum class OrphanStatus: uint8_t { LeftOrphan = 0, RightOrphan = 1, Paired = 2 };
+enum class OrphanStatus : uint8_t {
+  LeftOrphan = 0,
+  RightOrphan = 1,
+  Paired = 2
+};
 
-    bool headersAreConsistent(SAM_hdr* h1, SAM_hdr* h2);
+bool headersAreConsistent(SAM_hdr* h1, SAM_hdr* h2);
 
-    bool headersAreConsistent(std::vector<SAM_hdr*>&& headers);
+bool headersAreConsistent(std::vector<SAM_hdr*>&& headers);
 
-    inline void reverseComplement(const char* s, int32_t l, std::string& o) {
-        if (l > o.size()) { o.resize(l, 'A'); }
-        int32_t j = 0;
-        for (int32_t i = l-1; i >= 0; --i, ++j) {
-            switch(s[i]) {
-            case 'A':
-            case 'a':
-                o[j] = 'T';
-                break;
-            case 'C':
-            case 'c':
-                o[j] = 'G';
-                break;
-            case 'T':
-            case 't':
-                o[j] = 'A';
-                break;
-            case 'G':
-            case 'g':
-                o[j] = 'C';
-                break;
-            default:
-                o[j] = 'N';
-                break;
-            } 
-        }
+inline void reverseComplement(const char* s, int32_t l, std::string& o) {
+  if (static_cast<decltype(o.size())>(l) > o.size()) {
+    o.resize(l, 'A');
+  }
+  int32_t j = 0;
+  for (int32_t i = l - 1; i >= 0; --i, ++j) {
+    switch (s[i]) {
+    case 'A':
+    case 'a':
+      o[j] = 'T';
+      break;
+    case 'C':
+    case 'c':
+      o[j] = 'G';
+      break;
+    case 'T':
+    case 't':
+      o[j] = 'A';
+      break;
+    case 'G':
+    case 'g':
+      o[j] = 'C';
+      break;
+    default:
+      o[j] = 'N';
+      break;
     }
-
-    inline std::string reverseComplement(const char* s, int32_t l) {
-        std::string o(l, 'A');
-        reverseComplement(s, l, o);
-        return o;
-    }
-   
-    template <typename AlnLibT>
-    void writeAbundances(const SalmonOpts& sopt,
-                         AlnLibT& alnLib,
-                         boost::filesystem::path& fname,
-                         std::string headerComments="");
-
-    template <typename AlnLibT>
-    void writeAbundancesFromCollapsed(const SalmonOpts& sopt,
-                         AlnLibT& alnLib,
-                         boost::filesystem::path& fname,
-                         std::string headerComments="");
-
-    template <typename AlnLibT>
-    void normalizeAlphas(const SalmonOpts& sopt,
-                         AlnLibT& alnLib);
-
-    bool isCompatible(const LibraryFormat observed,
-                      const LibraryFormat expected,
-                      int32_t start,
-                      bool isForward,
-                      rapmap::utils::MateStatus ms);
-
-    double logAlignFormatProb(const LibraryFormat observed,
-                              const LibraryFormat expected,
-                              int32_t start, bool isForward,
-                              rapmap::utils::MateStatus ms,
-                              double incompatPrior);
-
-    bool compatibleHit(const LibraryFormat expected, int32_t start, bool isForward, MateStatus ms);
-    bool compatibleHit(const LibraryFormat expected, const LibraryFormat observed);
-
-    std::ostream& operator<<(std::ostream& os, OrphanStatus s);
-    /**
-    *  Given the information about the position and strand from which a paired-end
-    *  read originated, return the library format with which it is compatible.
-    */
-    LibraryFormat hitType(int32_t end1Start, bool end1Fwd,
-                          int32_t end2Start, bool end2Fwd);
-    LibraryFormat hitType(int32_t end1Start, bool end1Fwd, uint32_t len1,
-                          int32_t end2Start, bool end2Fwd, uint32_t len2, bool canDovetail);
-    /**
-    *  Given the information about the position and strand from which the
-    *  single-end read originated, return the library format with which it
-    *  is compatible.
-    */
-    LibraryFormat hitType(int32_t readStart, bool isForward);
-
+  }
 }
+
+inline std::string reverseComplement(const char* s, int32_t l) {
+  std::string o(l, 'A');
+  reverseComplement(s, l, o);
+  return o;
 }
+
+template <typename AlnLibT>
+void writeAbundances(const SalmonOpts& sopt, AlnLibT& alnLib,
+                     boost::filesystem::path& fname,
+                     std::string headerComments = "");
+
+template <typename AlnLibT>
+void writeAbundancesFromCollapsed(const SalmonOpts& sopt, AlnLibT& alnLib,
+                                  boost::filesystem::path& fname,
+                                  std::string headerComments = "");
+
+template <typename AlnLibT>
+void normalizeAlphas(const SalmonOpts& sopt, AlnLibT& alnLib);
+
+bool isCompatible(const LibraryFormat observed, const LibraryFormat expected,
+                  int32_t start, bool isForward, MateStatus ms);
+
+double logAlignFormatProb(const LibraryFormat observed,
+                          const LibraryFormat expected, int32_t start,
+                          bool isForward, MateStatus ms,
+                          double incompatPrior);
+
+bool compatibleHit(const LibraryFormat expected, int32_t start, bool isForward,
+                   MateStatus ms);
+bool compatibleHit(const LibraryFormat expected, const LibraryFormat observed);
+
+std::ostream& operator<<(std::ostream& os, OrphanStatus s);
+/**
+ *  Given the information about the position and strand from which a paired-end
+ *  read originated, return the library format with which it is compatible.
+ */
+LibraryFormat hitType(int32_t end1Start, bool end1Fwd, int32_t end2Start,
+                      bool end2Fwd);
+LibraryFormat hitType(int32_t end1Start, bool end1Fwd, uint32_t len1,
+                      int32_t end2Start, bool end2Fwd, uint32_t len2,
+                      bool canDovetail);
+/**
+ *  Given the information about the position and strand from which the
+ *  single-end read originated, return the library format with which it
+ *  is compatible.
+ */
+LibraryFormat hitType(int32_t readStart, bool isForward);
+
+double compute_1_edit_threshold(int32_t l, const SalmonOpts& sopt);
+
+/**
+ *  Cache the mappings provided in an efficient binary format
+ *  to the provided file handle.
+ *  NOTE: This function assumes the file handle is unique to
+ *  the calling thread, no attempt is made to synchronize
+ *  output between multiple threads.
+ */
+  //template <typename AlnT>
+  //using AlnGroupVecRange = core::range<typename AlnGroupVec<AlnT>::iterator>;
+  //void cacheMappings(AlnGroupVecRange<QuasiAlignment> hits, std::ofstream& ofile);
+
+
+} // namespace utils
+} // namespace salmon
 
 #endif // __SALMON_UTILS_HPP__

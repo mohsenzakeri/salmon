@@ -1,11 +1,11 @@
 #ifndef SIMPLE_POS_BIAS_HPP
 #define SIMPLE_POS_BIAS_HPP
 
+#include "spdlog/spdlog.h"
 #include "spline.h"
 #include <array>
-#include <vector>
-#include "spdlog/spdlog.h"
 #include <boost/iostreams/filtering_stream.hpp>
+#include <vector>
 
 class SimplePosBias {
 public:
@@ -31,14 +31,14 @@ public:
   void finalize();
 
   // Seralize this model.
-  bool writeBinary(boost::iostreams::filtering_ostream& out) const; 
+  bool writeBinary(boost::iostreams::filtering_ostream& out) const;
 
 private:
   int32_t numBins_;
   std::vector<double> masses_;
   bool isLogged_{true};
   bool isFinalized_{false};
-  tk::spline s_;
+  ::tk::spline s_;
   // position bins taken from Cufflinks:
   // https://github.com/cole-trapnell-lab/cufflinks/blob/master/src/biascorrection.cpp
   const std::vector<double> positionBins_{{.02, .04, .06, .08, .10, .15, .2,

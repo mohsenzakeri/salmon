@@ -40,7 +40,7 @@ def main(args):
     
     txpNames = None
     with gzip.open(nameFile) as nf:
-        txpNames = nf.read().strip().split('\t')
+        txpNames = nf.read().decode().strip().split('\t')
     
     ntxp = len(txpNames)
     logging.info("Expecting bootstrap info for {} transcripts".format(ntxp))
@@ -49,7 +49,8 @@ def main(args):
         meta_info = json.load(fh)
         
     if meta_info['samp_type'] == 'gibbs':
-        s = struct.Struct('<' + 'i' * ntxp)
+        #s = struct.Struct('<' + 'i' * ntxp)
+        s = struct.Struct('@' + 'd' * ntxp)
     elif meta_info['samp_type'] == 'bootstrap':
         s = struct.Struct('@' + 'd' * ntxp)
     else:
@@ -80,7 +81,10 @@ def main(args):
                     xs = map(str, x)
                     ofile.write('\t'.join(xs) + '\n')
                     numBoot += 1
-                except:
+                except Exception as ex:
+                    logging.info("read all bootstrap values")
+                    break
+                except BaseException:
                     logging.info("read all bootstrap values")
                     break
 

@@ -1,5 +1,5 @@
 Salmon
-================
+===============
 
 Salmon is a tool for **wicked-fast** transcript quantification from RNA-seq
 data.  It requires a set of target transcripts (either from a reference or
@@ -9,16 +9,46 @@ containing your reads.  Optionally, Salmon can make use of pre-computed
 alignments (in the form of a SAM/BAM file) to the transcripts rather than the
 raw reads.
 
-The **quasi-mapping**-based mode of Salmon runs in two phases; indexing and
+The **mapping**-based mode of Salmon runs in two phases; indexing and
 quantification. The indexing step is independent of the reads, and only need to
 be run one for a particular set of reference transcripts. The quantification
 step, obviously, is specific to the set of RNA-seq reads and is thus run more
 frequently. For a more complete description of all available options in Salmon,
 see below.
 
+.. note:: Selective alignment
+
+   Selective alignment, first introduced by the ``--validateMappings`` flag
+   in salmon, and now the default mapping strategy (in version 1.0.0
+   forward), is a major feature enhancement introduced in recent versions of
+   salmon. When salmon is run with selective alignment, it adopts a
+   considerably more sensitive scheme that we have developed for finding the
+   potential mapping loci of a read, and score potential mapping loci using
+   the chaining algorithm introdcued in minimap2 [#minimap2]_. It scores and
+   validates these mappings using the score-only, SIMD, dynamic programming
+   algorithm of ksw2 [#ksw2]_. Finally, we recommend using selective
+   alignment with a *decoy-aware* transcriptome, to mitigate potential
+   spurious mapping of reads that actually arise from some unannotated
+   genomic locus that is sequence-similar to an annotated transcriptome. The
+   selective-alignment algorithm, the use of a decoy-aware transcriptome, and
+   the influence of running salmon with different mapping and alignment
+   strategies is covered in detail in the paper `Alignment and mapping methodology influence transcript abundance estimation <https://www.biorxiv.org/content/10.1101/657874v1>`_.
+
+   The use of selective alignment implies the use of range factorization, as mapping
+   scores become very meaningful with this option. Selective alignment can
+   improve the accuracy, sometimes considerably, over the faster, but
+   less-precise mapping algorithm that was previously used.  Also, there are a number of 
+   options and flags that allow the user to control details about how the scoring is 
+   carried out, including setting match, mismatch, and gap scores, and choosing the minimum 
+   score below which an alignment will be considered invalid, and therefore not used for the
+   purposes of quantification. 
+
 The **alignment**-based mode of Salmon does not require indexing.  Rather, you can 
 simply provide Salmon with a FASTA file of the transcripts and a SAM/BAM file
 containing the alignments you wish to use for quantification.
+
+Salmon is, and will continue to be, `freely and actively supported on a best-effort basis <https://oceangenomics.com/about/#open>`_.
+If you are in need of industrial-grade technical support, please consider the options at `oceangenomics.com/support <https://oceangenomics.com/support>`_.
 
 Using Salmon
 ------------
@@ -69,88 +99,56 @@ set of alignments.
     to process fragments more quickly than they can be provided via the parser.
  
     
-"""""""""""""""""""""""""""""""""""""""
-Providing multiple read files to Salmon
-"""""""""""""""""""""""""""""""""""""""
-
-Often, a single library may be split into multiple FASTA/Q files.  Also, sometimes one may wish
-to quantify multiple replicates or samples together, treating them as if they are one library.
-Salmon allows the user to provide a *space-separated* list of read files to all of it's options
-that expect input files (i.e. ``-r``, ``-1``, ``-2``).  When the input is paired-end reads, the
-order of the files in the left and right lists must be the same.  There are a number of ways to
-provide salmon with multiple read files, and treat these as a single library.  For the examples
-below, assume we have two replicates ``lib_1`` and ``lib_2``.  The left and right reads for
-``lib_1`` are ``lib_1_1.fq`` and ``lib_1_2.fq``, respectively.  The left and right reads for
-``lib_2`` are ``lib_2_1.fq`` and ``lib_2_2.fq``, respectively.  The following are both valid
-ways to input these reads to Salmon::
-
-  > salmon quant -i index -l IU -1 lib_1_1.fq lib_2_1.fq -2 lib_1_2.fq lib_2_2.fq -o out
-
-  > salmon quant -i index -l IU -1 <(cat lib_1_1.fq lib_2_1.fq) -2 <(cat lib_1_2.fq lib_2_2.fq) -o out
-
-Similarly, both of these approaches can be adopted if the files are gzipped as well::
-
-   > salmon quant -i index -l IU -1 lib_1_1.fq.gz lib_2_1.fq.gz -2 lib_1_2.fq.gz lib_2_2.fq.gz -o out
-
-   > salmon quant -i index -l IU -1 <(gunzip -c lib_1_1.fq.gz lib_2_1.fq.gz) -2 <(gunzip -c lib_1_2.fq.gz lib_2_2.fq.gz) -o out
-
-In each pair of commands, the first command lets Salmon natively parse the files, while the latter command
-creates, on-the-fly, an input stream that consists of the concatenation of both files.  Both methods work, and
-are acceptable ways to merge the files.  The latter method (i.e. process substitution) allows more complex
-processing to be done to the reads in the substituted process before they are passed to Salmon as input, and thus,
-in some situations, is more versatile.
-
-    
-Quasi-mapping-based mode (including lightweight alignment)
+Preparing transcriptome indices (mapping-based mode) 
 ----------------------------------------------------------
 
 One of the novel and innovative features of Salmon is its ability to accurately
-quantify transcripts using *quasi-mappings*. Quasi-mappings 
-are mappings of reads to transcript positions that are computed without
-performing a base-to-base alignment of the read to the transcript.  Quasi-mapping
-is typically **much** faster to compute than traditional (or full)
-alignments, and can sometimes provide superior accuracy by being more robust 
-to errors in the read or genomic variation from the reference sequence.  More details
-about quasi-mappings, and how they are computed, can be found `here <http://bioinformatics.oxfordjournals.org/content/32/12/i192.full>`_.
+quantify transcripts without having previously aligned the reads using its fast,
+built-in selective-alignment mapping algorithm. Further details about the selective alignment algorithm can be
+found `here <https://www.biorxiv.org/content/10.1101/657874v1>`_.
 
-Salmon currently supports two different methods for mapping reads to transcriptomes;
-(SMEM-based) lightweight-alignment and quasi-mapping.  SMEM-based mapping is the original 
-lightweight-alignment method used by Salmon, and quasi-mapping is a newer and 
-considerably faster alternative.  Both methods are currently exposed via the 
-same ``quant`` command, but the methods require different indices so that 
-SMEM-based mapping cannot be used with a quasi-mapping index and vice-versa.
+If you want to use Salmon in mapping-based mode, then you first have to build a
+salmon index for your transcriptome. Assume that ``transcripts.fa`` contains the
+set of transcripts you wish to quantify. We generally recommend that you build a
+*decoy-aware* transcriptome file. 
 
-If you want to use Salmon in quasi-mapping-based mode, then you first
-have to build an Salmon index for your transcriptome.  Assume that
-``transcripts.fa`` contains the set of transcripts you wish to quantify. First,
-you run the Salmon indexer:
+There are two options for generating a decoy-aware transcriptome:
+
+- The first is to compute a set of decoy sequences by mapping the annotated transcripts you wish to index
+  against a hard-masked version of the organism's genome.  This can be done with e.g. 
+  `MashMap2  <https://github.com/marbl/MashMap>`_, and we provide some simple scripts to 
+  greatly simplify this whole process.  Specifically, you can use the 
+  `generateDecoyTranscriptome.sh <https://github.com/COMBINE-lab/SalmonTools/blob/master/scripts/generateDecoyTranscriptome.sh>`_
+  script, whose instructions you can find `in this README <https://github.com/COMBINE-lab/SalmonTools/blob/master/README.md>`_. 
+
+- The second is to use the entire genome of the organism as the decoy sequence. This can be 
+  done by concatenating the genome to the end of the transcriptome you want to index and populating 
+  the `decoys.txt` file with the chromosome names.  Detailed instructions on how to prepare this 
+  type of decoy sequence is available `here <https://combine-lab.github.io/alevin-tutorial/2019/selective-alignment/>`_.
+  This scheme provides a more comprehensive set of decoys, but, obviously, requires considerably more memory to build the index.
+
+Finally, pre-built versions of both the *partial* decoy and *full* decoy (i.e. using the whole genome) salmon indices 
+for some common organisms are available via refgenie `here <http://refgenomes.databio.org/>`_.
+
+If you are not using a pre-computed index, you run the salmon indexer as so:
 
 ::
     
-    > ./bin/salmon index -t transcripts.fa -i transcripts_index --type quasi -k 31 
+    > ./bin/salmon index -t transcripts.fa -i transcripts_index --decoys decoys.txt -k 31
     
-This will build the quasi-mapping-based index, using an auxiliary k-mer hash
-over k-mers of length 31.  While quasi-mapping will make used of arbitrarily 
+This will build the mapping-based index, using an auxiliary k-mer hash
+over k-mers of length 31.  While the mapping algorithms will make used of arbitrarily 
 long matches between the query and reference, the `k` size selected here will 
 act as the *minimum* acceptable length for a valid match.  Thus, a smaller 
 value of `k` may slightly improve sensitivty.  We find that a `k` of 31 seems
 to work well for reads of 75bp or longer, but you might consider a smaller 
-`k` if you plan to deal with shorter reads. Note that there is also a 
-`k` parameter that can be passed to the ``quant`` command.  However, this has
-no effect if one is using a quasi-mapping index, as the `k` value provided
-during the index building phase overrides any `k` provided during
-quantification in this case.  Since quasi-mapping is the default index type in 
-Salmon, you can actually leave off the ``--type quasi`` parameter when building 
-the index.  To build a lightweight-alignment (FMD-based) index instead, one
-would use the following command:
+`k` if you plan to deal with shorter reads. Also, a shoter value of `k` may
+improve sensitivity even more when using selective alignment (enabled via the `--validateMappings` flag).  So,
+if you are seeing a smaller mapping rate than you might expect, consider building
+the index with a slightly smaller `k`.  
 
-::
-    
-    > ./bin/salmon index -t transcripts.fa -i transcripts_index --type fmd
-
-Note that no value of `k` is given here.  However, the SMEM-based mapping index
-makes use of a parameter `k` that is passed in during the ``quant`` phase (the
-default value is `19`). 
+Quantifying in mapping-based mode
+---------------------------------------
 
 Then, you can quantify any set of reads (say, paired-end reads in files
 `reads1.fq` and `reads2.fq`) directly against this index using the Salmon
@@ -158,19 +156,15 @@ Then, you can quantify any set of reads (say, paired-end reads in files
 
 ::
 
-    > ./bin/salmon quant -i transcripts_index -l <LIBTYPE> -1 reads1.fq -2 reads2.fq -o transcripts_quant
+    > ./bin/salmon quant -i transcripts_index -l <LIBTYPE> -1 reads1.fq -2 reads2.fq --validateMappings -o transcripts_quant
 
 If you are using single-end reads, then you pass them to Salmon with 
 the ``-r`` flag like:
 
 ::
 
-    > ./bin/salmon quant -i transcripts_index -l <LIBTYPE> -r reads.fq -o transcripts_quant
+    > ./bin/salmon quant -i transcripts_index -l <LIBTYPE> -r reads.fq --validateMappings -o transcripts_quant
 
-
-This same ``quant`` command will work with either index (quasi-mapping or
-SMEM-based), and Salmon will automatically determine the type of index being 
-read and perform the appropriate lightweight mapping accordingly.
 
 .. note:: Order of command-line parameters
 
@@ -186,8 +180,47 @@ will be a directory called ``salmon_quant``, that contains a file called
 ``quant.sf`` containing the quantification results.
 
 
-Alignment-based mode
---------------------
+"""""""""""""""""""""""""""""""""""""""
+Providing multiple read files to Salmon
+"""""""""""""""""""""""""""""""""""""""
+
+Often, a single library may be split into multiple FASTA/Q files.  Also, sometimes one may wish
+to quantify multiple replicates or samples together, treating them as if they are one library.
+Salmon allows the user to provide a *space-separated* list of read files to all of it's options
+that expect input files (i.e. ``-r``, ``-1``, ``-2``).  When the input is paired-end reads, the
+order of the files in the left and right lists must be the same.  There are a number of ways to
+provide salmon with multiple read files, and treat these as a single library.  For the examples
+below, assume we have two replicates ``lib_1`` and ``lib_2``.  The left and right reads for
+``lib_1`` are ``lib_1_1.fq`` and ``lib_1_2.fq``, respectively.  The left and right reads for
+``lib_2`` are ``lib_2_1.fq`` and ``lib_2_2.fq``, respectively.  The following are both valid
+ways to input these reads to Salmon::
+
+  > salmon quant -i index -l IU -1 lib_1_1.fq lib_2_1.fq -2 lib_1_2.fq lib_2_2.fq --validateMappings -o out
+
+  > salmon quant -i index -l IU -1 <(cat lib_1_1.fq lib_2_1.fq) -2 <(cat lib_1_2.fq lib_2_2.fq) --validateMappings -o out
+
+Similarly, both of these approaches can be adopted if the files are gzipped as well::
+
+   > salmon quant -i index -l IU -1 lib_1_1.fq.gz lib_2_1.fq.gz -2 lib_1_2.fq.gz lib_2_2.fq.gz --validateMappings -o out
+
+   > salmon quant -i index -l IU -1 <(gunzip -c lib_1_1.fq.gz lib_2_1.fq.gz) -2 <(gunzip -c lib_1_2.fq.gz lib_2_2.fq.gz) --validateMappings -o out
+
+In each pair of commands, the first command lets Salmon natively parse the files, while the latter command
+creates, on-the-fly, an input stream that consists of the concatenation of both files.  Both methods work, and
+are acceptable ways to merge the files.  The latter method (i.e. process substitution) allows more complex
+processing to be done to the reads in the substituted process before they are passed to Salmon as input, and thus,
+in some situations, is more versatile.
+
+.. note:: Interleaved FASTQ files
+
+   Salmon does not currently have built-in support for interleaved FASTQ files (i.e., paired-end
+   files where both pairs are stored in the same file).  We provide a `script <https://github.com/COMBINE-lab/salmon/blob/master/scripts/runner.sh>`_
+   that can be used to run salmon with interleaved input.  However, this script assumes that the
+   input reads are perfectly synchronized.  That is, the input cannot contain any un-paired reads.
+
+
+Quantifying in alignment-based mode
+-----------------------------------
 
 Say that you've prepared your alignments using your favorite aligner and the
 results are in the file ``aln.bam``, and assume that the sequence of the
@@ -243,8 +276,94 @@ Salmon exposes a number of useful optional command-line parameters to the user.
 The particularly important ones are explained here, but you can always run
 ``salmon quant -h`` to see them all.
 
+"""""""""""""""""""""""""""""""
+``--validateMappings``
+"""""""""""""""""""""""""""""""
+
+Enables selective alignment of the sequencing reads when mapping them to the transcriptome.
+This can improve both the sensitivity and specificity of mapping and, as a result, can
+improve quantification accuracy.  When used in conjunction with the ``-z`` / ``--writeMappings``
+flag, the alignment records in the resulting SAM file will also be augmented with their alignment
+scores.
+
+If you pass the ``--validateMappings`` flag to salmon, in addition to using a
+more sensitive and accurate mapping algorithm, it will run an extension
+alignment dynamic program on the potential mappings it produces. The alignment
+procedure used to validate these mappings makes use of the highly-efficient and
+SIMD-parallelized ksw2 [#ksw2]_ library. Moreover, salmon makes use of an
+intelligent alignment cache to avoid re-computing alignment scores against
+redundant transcript sequences (e.g. when a read maps to the same exon in
+multiple different transcripts). The exact parameters used for scoring
+alignments, and the cutoff used for which mappings should be reported at all,
+are controllable by parameters described below.
+
+""""""""""""""""""""""""
+``--mimicBT2``
+""""""""""""""""""""""""
+
+This flag is a "meta-flag" that sets the parameters related to mapping and
+selective alignment to mimic alignment using Bowtie2 (with the flags
+``--no-discordant`` and ``--no-mixed``), but using the default scoring scheme
+and allowing both mismatches and indels in alignments.
+
+
+""""""""""""""""""""""""""""""
+``--mimicStrictBT2``
+""""""""""""""""""""""""""""""
+
+This flag is a "meta-flag" that sets the parameters related to mapping and
+selective alignment to mimic alignment using Bowtie2 (with the flags suggested
+by RSEM), but using the default scoring scheme and allowing both mismatches and
+indels in alignments. These setting essentially disallow indels in the resulting
+alignments.
+
+""""""""""""""""""""""""""""""
+``--recoverOrphans``
+""""""""""""""""""""""""""""""
+
+This flag (which should only be used in conjunction with selective alignment),
+performs orphan "rescue" for reads. That is, if mappings are discovered for only
+one end of a fragment, or if the mappings for the ends of the fragment don't
+fall on the same transcript, then this flag will cause salmon to look upstream
+or downstream of the discovered mapping (anchor) for a match for the opposite
+end of the given fragment. This is done by performing "infix" alignment within
+the maximum fragment length upstream of downstream of the anchor mapping using
+edlib.
+
 """"""""""""""""""""""""""
-``-p`` / ``--numThreads``
+``--hardFilter``
+""""""""""""""""""""""""""
+
+This flag (which should only be used with selective alignment) turns off soft
+filtering and range-factorized equivalence classes, and removes all but the
+equally highest scoring mappings from the equivalence class label for each
+fragment. While we recommend using soft filtering (the default) for
+quantification, this flag can produce easier-to-understand equivalence classes
+if that is the primary object of study.
+
+"""""""""""""""""""""""""
+``--skipQuant``
+"""""""""""""""""""""""""
+
+Related to the above, this flag will stop execution before the actual
+quantification algorithm is run.
+
+
+"""""""""""""""""""""""""""""
+``--allowDovetail``
+"""""""""""""""""""""""""""""
+
+Dovetailing mappings and alignments are considered discordant and discarded by
+default --- this is the same behavior that is adopted by default in Bowtie2.
+This is a change from the older behavior of salmon where dovetailing mappings
+were considered concordant and counted by default. If you wish to consider
+dovetailing mappings as concordant (the previous behavior), you can do so by
+passing the flag to salmon quant. Exotic library types (e.g. MU, MSF, MSR) are
+no longer supported. If you need support for such a library type, please submit
+a feature request describing the use-case.
+
+""""""""""""""""""""""""""
+``-p`` / ``--threads``
 """"""""""""""""""""""""""
 
 The number of threads that will be used for quasi-mapping, quantification, and
@@ -252,9 +371,18 @@ bootstrapping / posterior sampling (if enabled).  Salmon is designed to work
 well with many threads, so, if you have a sufficient number of processors, larger
 values here can speed up the run substantially.
 
-""""""""""""
+.. note:: Default number of threads
+
+  The default behavior is for Salmon to probe the number of available hardware
+  threads and to use this number. Thus, if you want to use fewer threads (e.g.,
+  if you are running multiple instances of Salmon simultaneously), you will
+  likely want to set this option explicitly in accordance with the desired
+  per-process resource usage.
+
+
+""""""""""""""""""""""
 ``--dumpEq``
-""""""""""""
+""""""""""""""""""""""
 
 If Salmon is passed the ``--dumpEq`` option, it will write a file in the auxiliary
 directory, called ``eq_classes.txt`` that contains the equivalence classes and corresponding
@@ -262,9 +390,27 @@ counts that were computed during quasi-mapping.  The file has a format described
 :ref:`eq-class-file`.
 
 
-"""""""""""""
+"""""""""""""""""""""""""""""
+``--incompatPrior``
+"""""""""""""""""""""""""""""
+
+This parameter governs the *a priori* probability that a fragment mapping or
+aligning to the reference in a manner incompatible with the prescribed library
+type is nonetheless the correct mapping. Note that Salmon sets this value, by
+default, to a small but *non-zero* probability. This means that if an
+incompatible mapping is the *only* mapping for a fragment, Salmon will still
+assign this fragment to the transcript. This default behavior is different than
+programs like `RSEM <https://deweylab.github.io/RSEM/>`_, which assign
+incompatible fragments a 0 probability (i.e., incompatible mappings will be
+discarded). If you wish to obtain this behavior, so that only compatible
+mappings will be considered, you can set ``--incompatPrior 0.0``.  This
+will cause Salmon to only consider mappings (or alignments) that are compatible
+with the prescribed or inferred library type.
+
+
+"""""""""""""""""""""""
 ``--fldMean``
-"""""""""""""
+"""""""""""""""""""""""
 *Note* : This option is only important when running Salmon with single-end reads.
 
 Since the empirical fragment length distribution cannot be estimated
@@ -273,13 +419,13 @@ user to set the expected mean fragment lenth of the sequencing
 library.  This value will affect the effective length correction, and
 hence the estimated effective lengths of the transcripts and the TPMs.
 The value passed to ``--fldMean`` will be used as the mean of the assumed
-fragment length distribution (which is modeled as a truncated Gaussan with
+fragment length distribution (which is modeled as a truncated Gaussian with
 a standard deviation given by ``--fldSD``).
 
 
-"""""""""""
+"""""""""""""""""""""
 ``--fldSD``
-"""""""""""
+"""""""""""""""""""""
 
 *Note* : This option is only important when running Salmon with single-end reads.
 
@@ -294,29 +440,113 @@ distribution (which is modeled as a truncated Gaussan with a mean
 given by ``--fldMean``).
 
 
+""""""""""""""""""""""""""""""""
+``--minScoreFraction``
+""""""""""""""""""""""""""""""""
+
+This value controls the minimum allowed score for a mapping to be considered valid.
+It matters only when ``--validateMappings`` has been passed to Salmon.  The maximum
+possible score for a fragment is ``ms = read_len * ma`` (or ``ms = (left_read_len + right_read_len) * ma``
+for paired-end reads).  The argument to ``--minScoreFraction`` determines what fraction of the maximum
+score ``s`` a mapping must achieve to be potentially retained.  For a minimum score fraction of ``f``, only
+mappings with a score > ``f * s`` will be kept.  Mappings with lower scores will be considered as low-quality,
+and will be discarded.
+
+It is worth noting that mapping validation uses extension alignment.  This means that the read need not
+map end-to-end.  Instead, the score of the mapping will be the position along the alignment with the
+highest score.  This is the score which must reach the fraction threshold for the read to be considered
+as valid.
+
+"""""""""""""""""""""""""
+``--bandwidth``
+"""""""""""""""""""""""""
+
+This flag (which is only meaningful in conjunction with selective alignment),
+sets the bandwidth parameter of the relevant calls to ksw2's alignment function.
+This determines how wide an area around the diagonal in the DP matrix should be
+calculated.
+
+"""""""""""""""""""""""""""""""
+``--maxMMPExtension``
+"""""""""""""""""""""""""""""""
+
+This flag (which should only be used with selective alignment) limits the length
+that a mappable prefix of a fragment may be extended before another search along
+the fragment is started. Smaller values for this flag can improve the
+sensitivity of mapping, but could increase run time.
+
+""""""""""""""""""
+``--ma``
+""""""""""""""""""
+
+This value should be a positive (typically small) integer.  It controls the score given
+to a match in the alignment between the query (read) and the reference.
+
+""""""""""""""""""
+``--mp``
+""""""""""""""""""
+
+This value should be a negative (typically small) integer.  It controls the score given
+to a mismatch in the alignment between the query (read) and the reference.
+
+""""""""""""""""""
+``--go``
+""""""""""""""""""
+
+This value should be a positive (typically small) integer. It controls the score
+penalty attributed to an alignment for each new gap that is opened. The
+alignment score computed uses an affine gap penalty, so the penalty of a gap is
+``go + l * ge`` where l is the gap length.  The value of ``go`` should typically
+be larger than that of ``ge``.
+
+""""""""""""""""""
+``--ge``
+""""""""""""""""""
+
+This value should be a positive (typically small) integer. It controls the score
+penalty attributed to the extension of a gap in an alignment. The
+alignment score computed uses an affine gap penalty, so the penalty of a gap is
+``go + l * ge`` where l is the gap length.  The value of ``ge`` should typically
+be smaller than that of ``go``.
+
+""""""""""""""""""""""""""""""""""""""
+``--rangeFactorizationBins``
+""""""""""""""""""""""""""""""""""""""
+
+The `range-factorization <https://academic.oup.com/bioinformatics/article/33/14/i142/3953977>`_ feature
+allows using a data-driven likelihood factorization, which can improve
+quantification accuracy on certain classes of "difficult" transcripts.
+Currently, this feature interacts best (i.e., yields the most considerable
+improvements) when either (1) using alignment-based mode and simultaneously
+enabling error modeling with ``--useErrorModel`` or (2) when enabling
+``--validateMappings`` in quasi-mapping-based mode. The argument to this option
+is a positive integer ``x``, that determines fidelity of the factorization.  The larger
+``x``, the closer the factorization to the un-factorized likelihood, but the larger
+the resulting number of equivalence classes.  A value of 1 corresponds to salmon's
+traditional rich equivalence classes.  We recommend 4 as a reasonable parameter
+for this option (it is what was used in the range-factorization paper).
+
 """"""""""""""
-``--useVBOpt``
+``--useEM``
 """"""""""""""
 
-Use the variational Bayesian EM algorithm rather than the "standard"
-EM algorithm to optimize abundance estimates.  The details of the VBEM
+Use the "standard" EM algorithm to optimize abundance estimates
+instead of the variational Bayesian EM algorithm.  The details of the VBEM
 algorithm can be found in [#salmon]_.  While both the standard EM and
 the VBEM produce accurate abundance estimates, there are some
-trade-offs between the approaches.  The EM algorithm tends to produce
-sparser estimates (i.e. more transcripts estimated to have 0
-abundance), while the VBEM, in part due to the prior, tends to
-estimate non-zero abundance for more transcripts.  Conversely, the
-prior used in the VBEM tends to have a regularizing effect, especially
-for low abundance transcripts, that leads to more consistent estimates
-of abundance at low expression levels.  We are currently working to
-analyze and understand all the tradeoffs between these different optimization
-approaches.  Also, the VBEM tends to converge after fewer iterations,
-so it may result in a shorter runtime; especially if you are computing
-many bootstrap samples.
+trade-offs between the approaches.  Specifically, the sparsity of
+the VBEM algorithm depends on the prior that is chosen.  When
+the prior is small, the VBEM tends to produce a sparser solution
+than the EM algorithm, while when the prior is relatively larger, it
+tends to estimate more non-zero abundances than the EM algorithm.
+It is an active research effort to analyze and understand all the tradeoffs
+between these different optimization approaches. Also, the VBEM tends to
+converge after fewer iterations, so it may result in a shorter runtime;
+especially if you are computing many bootstrap samples.
 
 The default prior used in the VB optimization is a *per-nucleotide* prior
-of 0.001 per nucleotide.  This means that a transcript of length 1000 will
-have a prior count of 1 fragment, while a transcript of length 500 will have
+of 1e-5 reads per-nucleotide.  This means that a transcript of length 100000 will
+have a prior count of 1 fragment, while a transcript of length 50000 will have
 a prior count of 0.5 fragments, etc.  This behavior can be modified in two
 ways.  First, the prior itself can be modified via Salmon's ``--vbPrior``
 option.  The argument to this option is the value you wish to place as the
@@ -328,10 +558,19 @@ prior count is no longer dependent on the transcript length.  However,
 the default behavior of a *per-nucleotide* prior is recommended when
 using VB optimization.
 
+.. note:: Choosing between EM and VBEM algorithms
 
-"""""""""""""""""""
+   As mentioned above, a thorough comparison of all of the benefits and detriments
+   of the different algorithms is an ongoing area of research.  However, preliminary
+   testing suggests that the sparsity-inducing effect of running the VBEM with a small
+   prior may lead, in general, to more accurate estimates (the current testing was
+   performed mostly through simulation). Hence, the VBEM is the default, and the
+   standard EM algorithm is accessed via the `--useEM` flag.
+
+
+"""""""""""""""""""""""""""""
 ``--numBootstraps``
-"""""""""""""""""""
+"""""""""""""""""""""""""""""
 
 Salmon has the ability to optionally compute bootstrapped abundance estimates.
 This is done by resampling (with replacement) from the counts assigned to
@@ -344,9 +583,9 @@ takes a positive integer that dictates the number of bootstrap samples to comput
 The more samples computed, the better the estimates of varaiance, but the
 more computation (and time) required.
 
-"""""""""""""""""""""
+"""""""""""""""""""""""""""""""
 ``--numGibbsSamples``
-"""""""""""""""""""""
+"""""""""""""""""""""""""""""""
 
 Just as with the bootstrap procedure above, this option produces samples that allow
 us to estimate the variance in abundance estimates.  However, in this case the
@@ -387,8 +626,19 @@ methodology.
 Passing the ``--gcBias`` flag to Salmon will enable it to learn and
 correct for fragment-level GC biases in the input data.  Specifically,
 this model will attempt to correct for biases in how likely a sequence
-is to be observed based on its internal GC content.  This bias is
-distinct from the primer biases learned with the ``--seqBias`` option.
+is to be observed based on its internal GC content.  
+
+You can use the FASTQC software followed by 
+`MultiQC with transcriptome GC distributions <http://multiqc.info/docs/#theoretical-gc-content>`_
+to check if your samples exhibit strong GC bias, i.e.
+under-representation of some sub-sequences of the transcriptome. If they do, 
+we obviously recommend using the ``--gcBias`` flag. Or you can simply run Salmon with 
+``--gcBias`` in any case, as it does not impair quantification for samples 
+without GC bias, it just takes a few more minutes per sample. For samples 
+with moderate to high GC bias, correction for this bias at the fragment level 
+has been shown to reduce isoform quantification errors [#alpine]_ [#salmon]_.
+
+This bias is distinct from the primer biases learned with the ``--seqBias`` option.
 Though these biases are distinct, they are not completely independent.
 When both ``--seqBias`` and ``--gcBias`` are enabled, Salmon will
 learn a conditional fragment-GC bias model.  By default, Salmon will
@@ -403,16 +653,10 @@ option ``--numGCBins``.
 arbitrary fragments, Salmon pre-computes and stores the cumulative GC
 count for each transcript.  This requires an extra 4-bytes per
 nucleotide.  While this extra memory usage should normally be minor,
-it can nonetheless be controlled with the ``--gcSizeSamp`` option.
-This option takes a positive integer argument *i*, such that Salmon
-stores the values of the cumulative GC count only at every
-*i*:sup:`th` nucleotide.  The cumulative GC count at values between
-the sampled positions are recomputed on-the-fly when necessary.  Using
-this option will reduce the memory required to store the GC
-information by a factor of *i*, but will slow down the computation of
-GC-fragment content by a factor of *i*/2.  Typically, the
-``--gcSizeSamp`` can be left at its default value of 1, but larger
-values can be chosen if necessary.
+it can nonetheless be controlled with the ``--reduceGCMemory`` option.
+This option replaces the per-nucleotide GC count with a rank-select
+capable bit vector, reducing the memory overhead from 4-bytes per
+nucleotide to ~1.25 bits, while being only marginally slower).
 
 """""""""""""""""""""
 ``--posBias``
@@ -422,16 +666,16 @@ Passing the ``--posBias`` flag to Salmon will enable modeling of a
 position-specific fragment start distribution.  This is meant to model
 non-uniform coverage biases that are sometimes present in RNA-seq data
 (e.g. 5' or 3' positional bias).  Currently, a small and fixed number
-of models are learned for different lenght classes of transcripts, as
+of models are learned for different length classes of transcripts, as
 is done in Roberts et al. [#roberts]_. *Note*: The positional bias
 model is relatively new, and is still undergoing testing.  It replaces
 the previous `--useFSPD` option, which is now deprecated.  This
 feature should be considered as *experimental* in the current release.
 
 
-"""""""""""""""""""
+"""""""""""""""""""""""""""""
 ``--biasSpeedSamp``
-"""""""""""""""""""
+"""""""""""""""""""""""""""""
 
 When evaluating the bias models (the GC-fragment model specifically),
 Salmon must consider the probability of generating a fragment of every
@@ -447,11 +691,12 @@ user to set this sampling factor.  Larger values speed up effective
 length correction, but may decrease the fidelity of bias modeling.
 However, reasonably small values (e.g. 10 or less) should have only a
 minor effect on the computed effective lengths, and can considerably
-speed up effective length correction on large transcriptomes.
+speed up effective length correction on large transcriptomes.  The
+default value for ``--biasSpeedSamp`` is 5.
 
-""""""""""""""""""""""""
+""""""""""""""""""""""""""""""""""
 ``--writeUnmappedNames``
-""""""""""""""""""""""""
+""""""""""""""""""""""""""""""""""
 
 Passing the ``--writeUnmappedNames`` flag to Salmon will tell Salmon to
 write out the names of reads (or mates in paired-end reads) that do not
@@ -479,9 +724,9 @@ generate this unmapped FASTA/Q file from the unmapped file and the original
 inputs.
 
 
-"""""""""""""""""""
+"""""""""""""""""""""""""""""
 ``--writeMappings``
-"""""""""""""""""""
+"""""""""""""""""""""""""""""
 
 Passing the ``--writeMappings`` argument to Salmon will have an effect
 only in mapping-based mode and *only when using a quasi-index*.  When
@@ -630,7 +875,7 @@ separate process when you use process substitution.
 
 **Finally**, the purpose of making this software available is for
 people to use it and provide feedback.  The
-`pre-print describing this method is on bioRxiv <http://biorxiv.org/content/early/2015/10/03/021592>`_.
+`paper describing this method is published in Nature Methods <http://rdcu.be/pQsw>`_.
 If you have something useful to report or just some interesting ideas
 or suggestions, please contact us (`rob.patro@cs.stonybrook.edu`
 and/or `carlk@cs.cmu.edu`).  If you encounter any bugs, please file a
@@ -640,8 +885,15 @@ and/or `carlk@cs.cmu.edu`).  If you encounter any bugs, please file a
 References
 ----------
 
-.. [#express] Roberts, Adam, and Lior Pachter. "Streaming fragment assignment for real-time analysis of sequencing experiments." Nature methods 10.1 (2013): 71-73.
-   
-.. [#roberts] Roberts, Adam, et al. "Improving RNA-Seq expression estimates by correcting for fragment bias." Genome biology 12.3 (2011): 1.
 
-.. [#salmon] Patro, Rob, et al. "Salmon provides accurate, fast, and bias-aware transcript expression estimates using dual-phase inference." bioRxiv (2016).
+.. [#express] Roberts, Adam, and Lior Pachter. "Streaming fragment assignment for real-time analysis of sequencing experiments." Nature Methods 10.1 (2013): 71-73.
+   
+.. [#roberts] Roberts, Adam, et al. "Improving RNA-Seq expression estimates by correcting for fragment bias." Genome Biology 12.3 (2011): 1.
+
+.. [#salmon] Patro, Rob, et al. "Salmon provides fast and bias-aware quantification of transcript expression." Nature Methods (2017). Advanced Online Publication. doi: 10.1038/nmeth.4197..
+
+.. [#alpine] Love, Michael I., Hogenesch, John B., Irizarry, Rafael A. "Modeling of RNA-seq fragment sequence bias reduces systematic errors in transcript abundance estimation." Nature Biotechnology 34.12 (2016). doi: 10.1038/nbt.368.2..
+
+.. [#minimap2] Li, Heng. "Minimap2: pairwise alignment for nucleotide sequences." Bioinformatics 34.18 (2018): 3094-3100. 
+
+.. [#ksw2] `Global alignment and alignment extension <https://github.com/lh3/ksw2>`_. 

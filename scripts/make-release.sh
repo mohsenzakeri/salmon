@@ -33,7 +33,7 @@ echo -e "Version = ${version}"
 echo -e "Host = ${host}"
 
 # create the binary directory 
-betaname=Salmon-${version}_${host}
+betaname=salmon-${version}_${host}
 mkdir ${DIR}/../RELEASES
 mkdir ${DIR}/../RELEASES/${betaname}
 mkdir ${DIR}/../RELEASES/${betaname}/bin
@@ -44,10 +44,14 @@ echo -e "Copying over the binary and Intel TBB libraries\n"
 cp ${DIR}/../bin/salmon ${DIR}/../RELEASES/${betaname}/bin/
 cp ${DIR}/../lib/libtbb* ${DIR}/../RELEASES/${betaname}/lib/
 
+# copy over the test data
+cp ${DIR}/../sample_data.tgz ${DIR}/../RELEASES/${betaname}/
+
 # copy other dependencies (shared libraries)
 echo -e "Copying over other shared library dependencies\n"
 bash ${DIR}/../scripts/cpld.bash ${DIR}/../bin/salmon ${DIR}/../RELEASES/${betaname}/lib/
 echo -e "Removing dangerous dependencies\n"
+rm ${DIR}/../RELEASES/${betaname}/lib/librt.so.1
 rm ${DIR}/../RELEASES/${betaname}/lib/libc.so.6
 rm ${DIR}/../RELEASES/${betaname}/lib/ld-linux-x86-64.so.2
 rm ${DIR}/../RELEASES/${betaname}/lib/libdl.so.2

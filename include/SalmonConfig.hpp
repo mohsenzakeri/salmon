@@ -1,6 +1,6 @@
 /**
 >HEADER
-    Copyright (c) 2014, 2015 Rob Patro robp@cs.stonybrook.edu
+    Copyright (c) 2014-2019 Rob Patro rob@cs.umd.edu
 
     This file is part of Salmon.
 
@@ -19,18 +19,18 @@
 <HEADER
 **/
 
-
 #ifndef SALMON_CONFIG_HPP
 #define SALMON_CONFIG_HPP
 
 #include <string>
 
 namespace salmon {
-	constexpr char majorVersion[] = "0";
-	constexpr char minorVersion[] = "7";
-	constexpr char patchVersion[] = "3";
-	constexpr char version[] = "0.7.3";
-    constexpr uint32_t indexVersion = 2;
-}
+constexpr char majorVersion[] = "1";
+constexpr char minorVersion[] = "3";
+constexpr char patchVersion[] = "0";
+constexpr char version[] = "1.3.0";
+constexpr uint32_t indexVersion = 5;
+constexpr char requiredQuasiIndexVersion[] = "p7";
+} // namespace salmon
 
 #endif // SALMON_CONFIG_HPP

@@ -1,93 +1,136 @@
-#include <unistd.h>
 #include <cstdio>
 #include <iostream>
-#include <unordered_map>
 #include <random>
+#include <unistd.h>
+#include <unordered_map>
 
+#include "FastxParser.hpp"
 #include "jellyfish/mer_dna.hpp"
-#include "jellyfish/stream_manager.hpp"
-#include "jellyfish/whole_sequence_parser.hpp"
 
 #include "FASTAParser.hpp"
-#include "Transcript.hpp"
-#include "SalmonStringUtils.hpp"
 #include "SalmonOpts.hpp"
+#include "SalmonStringUtils.hpp"
+#include "Transcript.hpp"
 
-FASTAParser::FASTAParser(const std::string& fname): fname_(fname) {}
+FASTAParser::FASTAParser(const std::string& fname) : fname_(fname) {}
 
-void FASTAParser::populateTargets(std::vector<Transcript>& refs, SalmonOpts& sopt) {
-    using stream_manager = jellyfish::stream_manager<std::vector<std::string>::const_iterator>;
-    using single_parser = jellyfish::whole_sequence_parser<stream_manager>;
+void FASTAParser::populateTargets(std::vector<Transcript>& refs,
+                                  SalmonOpts& sopt) {
+  using single_parser = fastx_parser::FastxParser<fastx_parser::ReadSeq>;
 
-    using std::string;
-    using std::unordered_map;
+  using std::string;
+  using std::unordered_map;
 
-    unordered_map<string, size_t> nameToID;
-    for (auto& ref : refs) {
-	nameToID[ref.RefName] = ref.id;
-    }
+  unordered_map<string, size_t> nameToID;
+  for (auto& ref : refs) {
+    nameToID[ref.RefName] = ref.id;
+  }
 
-    // Separators for the header (default ' ' and '\t')
-    // If we have the gencode flag, then add '|'.
-    std::string sepStr = " \t";
-    if (sopt.gencodeRef) {
-        sepStr += '|';
-    }
+  // Separators for the header (default ' ' and '\t')
+  // If we have the gencode flag, then add '|'.
+  std::string sepStr = " \t";
+  if (sopt.gencodeRef) {
+    sepStr += '|';
+  }
 
-    std::vector<std::string> readFiles{fname_};
-    size_t maxReadGroup{1000}; // Number of files to read simultaneously
-    size_t concurrentFile{1}; // Number of reads in each "job"
-    stream_manager streams(readFiles.cbegin(), readFiles.cend(), concurrentFile);
-    single_parser parser(4, maxReadGroup, concurrentFile, streams);
+  std::vector<std::string> readFiles{fname_};
+  size_t maxReadGroup{1000}; // Number of files to read simultaneously
+  size_t concurrentFile{1};  // Number of reads in each "job"
 
-    constexpr char bases[] = {'A', 'C', 'G', 'T'};
-    // Create a random uniform distribution
-    std::random_device rd;
-    std::default_random_engine eng(rd());
-    std::uniform_int_distribution<> dis(0, 3);
-    uint64_t numNucleotidesReplaced{0};
+  single_parser parser(readFiles, 1, 1, maxReadGroup);
+  parser.start();
 
-    while(true) {
-        typename single_parser::job j(parser); // Get a job from the parser: a bunch of read (at most max_read_group)
-        if(j.is_empty()) break;           // If got nothing, quit
+  constexpr char bases[] = {'A', 'C', 'G', 'T'};
+  // Create a random uniform distribution
+  std::random_device rd;
+  std::default_random_engine eng(rd());
+  std::uniform_int_distribution<> dis(0, 3);
+  uint64_t numNucleotidesReplaced{0};
 
-        for(size_t i = 0; i < j->nb_filled; ++i) { // For all the read we got
-            std::string& header = j->data[i].header;
-            std::string name = header.substr(0, header.find_first_of(sepStr));
+  // All header names we encounter in the fasta file
+  std::unordered_set<std::string> fastaNames;
 
-            auto it = nameToID.find(name);
-            if (it == nameToID.end()) {
-                std::cerr << "WARNING: Transcript " << name << " appears in the reference but did not appear in the BAM\n";
-            } else {
+  auto rg = parser.getReadGroup();
+  while (parser.refill(rg)) {
+    for (auto& read : rg) {
+      std::string& header = read.name;
+      std::string name = header.substr(0, header.find_first_of(sepStr));
 
-	      std::string& seq = j->data[i].seq;
-              size_t readLen = seq.length();
+      if (fastaNames.find(name) != fastaNames.end()){
+        sopt.jointLog->error("Transcript {} appears twice in the transcript FASTA file. "
+                             "Duplicate transcripts or transcripts with the same name are not allowed.",
+                             name);
+        sopt.jointLog->flush();
+        std::exit(1);
+      }
 
-	      refs[it->second].setSAMSequenceOwned(salmon::stringtools::encodeSequenceInSAM(seq.c_str(), readLen));
+      fastaNames.insert(name);
 
-	      // Replace non-ACGT bases
-	      for (size_t b = 0; b < readLen; ++b) {
-		seq[b] = ::toupper(seq[b]);
-		int c = jellyfish::mer_dna::code(seq[b]);
-		// Replace non-ACGT bases with pseudo-random bases
-		if (jellyfish::mer_dna::not_dna(c)) {
-		  char rbase = bases[dis(eng)];
-		  c = jellyfish::mer_dna::code(rbase);
-		  seq[b] = rbase;
-		  ++numNucleotidesReplaced;
-		}
-	      }
+      auto it = nameToID.find(name);
+      if (it == nameToID.end()) {
+        sopt.jointLog->warn("Transcript {} appears in the reference but did "
+                            "not appear in the BAM",
+                            name);
+      } else {
 
-	      // allocate space for the new copy
-	      char* seqCopy = new char[seq.length()+1];
-	      std::strcpy(seqCopy, seq.c_str());
-	      refs[it->second].setSequenceOwned(seqCopy, sopt.gcBiasCorrect, sopt.gcSampFactor);
-	      // seqCopy will only be freed when the transcript is destructed!
-            }
+        std::string& seq = read.seq;
+        size_t readLen = seq.length();
+
+        refs[it->second].setSAMSequenceOwned(
+            salmon::stringtools::encodeSequenceInSAM(seq.c_str(), readLen));
+
+        // Replace non-ACGT bases
+        for (size_t b = 0; b < readLen; ++b) {
+          seq[b] = ::toupper(seq[b]);
+          int c = jellyfish::mer_dna::code(seq[b]);
+          // Replace non-ACGT bases with pseudo-random bases
+          if (jellyfish::mer_dna::not_dna(c)) {
+            char rbase = bases[dis(eng)];
+            c = jellyfish::mer_dna::code(rbase);
+            seq[b] = rbase;
+            ++numNucleotidesReplaced;
+          }
         }
+
+        // allocate space for the new copy
+        char* seqCopy = new char[seq.length() + 1];
+        std::strcpy(seqCopy, seq.c_str());
+        refs[it->second].setSequenceOwned(seqCopy, sopt.gcBiasCorrect,
+                                          sopt.reduceGCMemory);
+        // seqCopy will only be freed when the transcript is destructed!
+      }
     }
+  }
 
-    std::cerr << "replaced " << numNucleotidesReplaced << " non-ACGT nucleotides with random nucleotides\n";
+  parser.stop();
 
+  // Check that every sequence present in the BAM header was also present in the
+  // transcriptome fasta.
+  bool missingTxpError{false};
+  for (auto& kv : nameToID) {
+    auto& name = kv.first;
+    if (fastaNames.find(name) == fastaNames.end()) {
+      sopt.jointLog->critical("Transcript {} appeared in the BAM header, but "
+                              "was not in the provided FASTA file",
+                              name);
+      missingTxpError = true;
+    }
+  }
+
+  if (missingTxpError) {
+    sopt.jointLog->critical(
+        "Please provide a reference FASTA file that includes all targets "
+        "present in the BAM header\n"
+        "If you have access to the genome FASTA and GTF used for alignment \n"
+        "consider generating a transcriptome fasta using a command like: \n"
+        "gffread -w output.fa -g genome.fa genome.gtf\n"
+        "you can find the gffread utility at "
+        "(http://ccb.jhu.edu/software/stringtie/gff.shtml)");
+    sopt.jointLog->flush();
+    std::exit(1);
+  }
+
+  sopt.jointLog->info(
+      "replaced {:n} non-ACGT nucleotides with random nucleotides",
+      numNucleotidesReplaced);
 }
-
