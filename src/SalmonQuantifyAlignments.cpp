@@ -321,6 +321,7 @@ void processMiniBatch(AlignmentLibraryT<FragT>& alnLib,
           // EQCLASS
           std::vector<uint32_t> txpIDs;
           std::vector<double> auxProbs;
+          std::vector<int32_t> startPositions;
           double auxDenom = salmon::math::LOG_0;
 
           // The alignments must be sorted by transcript id
@@ -575,7 +576,7 @@ void processMiniBatch(AlignmentLibraryT<FragT>& alnLib,
             }
 
             TranscriptGroup tg(txpIDs);
-            eqBuilder.addGroup(std::move(tg), auxProbs);
+            eqBuilder.addGroup(std::move(tg), auxProbs, startPositions, startPositions, salmonOpts);
           }
 
           // Are we doing bias correction?

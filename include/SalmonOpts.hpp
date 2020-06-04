@@ -184,7 +184,8 @@ struct SalmonOpts {
   bool quiet; // Be quiet during quantification.
 
   bool useEM; // Use "regular" EM in the batch passes
-
+  bool useFMEMOpt{false};
+  double bucket_size{10.0};
   bool useVBOpt; // Use Variational Bayesian EM instead of "regular" EM in the
                  // batch passes
   uint32_t sigDigits; // number of siginificant digits to print for EffectiveLength

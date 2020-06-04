@@ -320,6 +320,120 @@ void VBEMUpdate_(EQVecT& eqVec,
       });
 }
 
+template <typename EQVecT>                 
+void EMUpdate_FM(EQVecT& eqVec,                
+               std::vector<Transcript>& transcripts,
+               const CollapsedEMOptimizer::VecType& alphaIn,
+               CollapsedEMOptimizer::VecType& alphaOut,                                                           
+               double bucket_size) {
+  assert(alphaIn.size() == alphaOut.size());
+  int hits = 0;                                                                                                   
+  tbb::parallel_for(                                                                                              
+      BlockedIndexRange(size_t(0), size_t(eqVec.size())),                              
+      [&eqVec, &alphaIn, &transcripts, &alphaOut, &bucket_size](const BlockedIndexRange& range) -> void {
+        for (auto eqID : boost::irange(range.begin(), range.end())) {
+          auto& kv = eqVec[eqID];                    
+          uint64_t count = kv.second.count;             
+          // for each transcript in this class
+          const TranscriptGroup& tgroup = kv.first;                                                               
+
+         //The FULL MODEL
+         if (tgroup.valid) {                                                                                      
+            const std::vector<uint32_t>& txps = tgroup.txps;                                                      
+            //const auto& auxs = kv.second.combinedWeights;                                                       
+                                                                                                                  
+            //double denom = 0.0;                  
+            size_t groupSize = kv.second.weights.size(); // txps.size();                                          
+            // If this is a single-transcript group,                                                              
+            // then it gets the full count.  Otherwise,                                                           
+            // update according to our VBEM rule.                                                                 
+            if (true or BOOST_LIKELY(groupSize > 1)) {                                                            
+                   size_t  allWeights_iter = 0;         
+                   const auto& auxs = kv.second.allWeights;                                                       
+              for (size_t f = 0; f< count; ++f) {                                                                 
+                double denom = 0.0;                                                                               
+                           //const auto& auxs = kv.second.allWeights;                                                                                                                                                                
+                if(groupSize+allWeights_iter-1>=auxs.size())std::cerr<<"extra.."<<count<<" "<<groupSize << " " << allWeights_iter<<" "<<auxs.size()<<"\n";                                                                           
+                double denom_ = 0.0;                                                                              
+                //compute the effect on coverage                                                                                                                                                                                     
+                std::vector<double> coverage;                                                                     
+                for (size_t i = 0; i < groupSize; ++i) {                                                          
+                  auto tid = txps[i];                                                                                                                                                                                                
+                  int32_t position = kv.second.startPositions[i + allWeights_iter];                               
+                  size_t bucket_pos = position/bucket_size;                                                                                                                                                                          
+                  size_t bucket_count = kv.second.fragmentLengths[i + allWeights_iter]/bucket_size+1.0;           
+                  double all_diffs = 0;       
+                  for(int j = 0; j < bucket_count; ++j) {                                                         
+                    double local_mean = 0;                                                                        
+                    double k = 1;                       
+                    double kk = 0;                                                                                                                                                                                                   
+                    for(k = std::max(0, (int)bucket_pos + j - 5); k < std::min(transcripts[tid].read_coverage.size() , bucket_pos + j + 6); ++k){                                                                                    
+                      kk += 1;
+                      local_mean += transcripts[tid].read_coverage[k];
+                      //std::cerr<<transcripts[tid].read_coverage[k]<<" ";
+                    }
+                    local_mean = local_mean/kk;
+                    if(std::isnan(local_mean)) std::cerr<<"local mean is nan\n";
+                    double diff = (transcripts[tid].read_coverage[bucket_pos + j]-local_mean)/(transcripts[tid].read_coverage[bucket_pos + j]+local_mean);
+                    double thresh = 0.0001;
+                    if(std::abs(diff) > thresh)
+                      all_diffs += diff;
+                    //std::cerr<<" -----> "<<local_mean << " " << kk <<" " << k << " " << std::min(transcripts[tid].read_coverage.size() , bucket_pos + j + 3) <<" " << transcripts[tid].read_coverage.size() << " " << bucket_pos <<" " << j << " "<< position<<" " <<bucket_size<<"\n";
+                  }
+                  double coverage_score = 0;
+                  //std::cerr<<" -----> "<<all_diffs << "\n";
+                  all_diffs = 0.5*all_diffs/(double)bucket_count;
+                  coverage_score = 0.5 - std::pow(all_diffs, 1);
+                  //std::cerr<<"score:"<< bucket_count<< " " << all_diffs<< " "<< coverage_score<<"\n";
+                  coverage.push_back(coverage_score);
+                }
+                for (size_t i = 0; i < groupSize; ++i) {
+                        auto tid = txps[i];
+                        auto aux = auxs[i + allWeights_iter ] * coverage[i];
+                        double v =  alphaIn[tid] * aux;
+                        denom += v;
+                        if(std::isnan(aux)) std::cerr<<aux <<" " << v << "nan\n";
+                }                      
+                if (denom <= ::minEQClassWeight) {
+                  // tgroup.setValid(false);
+                } else {
+                  double invDenom = 1.0 / denom;
+                  for (size_t i = 0; i < groupSize; ++i) {
+                    auto tid = txps[i];
+                    auto aux = auxs[i + allWeights_iter ] * coverage[i];
+                    double v = alphaIn[tid] * aux;
+                    if (!std::isnan(v)) {
+                      salmon::utils::incLoop(alphaOut[tid], v * invDenom);
+
+                      int32_t position = kv.second.startPositions[i + allWeights_iter];
+                      if (position<0) std::cerr<<kv.second.startPositions.size() << " " << i+allWeights_iter <<" " << position<<"\n";
+                      //salmon::utils::incLoop(transcripts[tid].read_coverage[position], v * invDenom);
+                      size_t bucket_pos = position/bucket_size;
+                      if(transcripts[tid].read_coverage.size()-1 < bucket_pos) std::cerr<<transcripts[tid].read_coverage.size()-1<<" " << bucket_pos <<"\n";
+                      size_t bucket_count = kv.second.fragmentLengths[i + allWeights_iter]/bucket_size+1.0;
+                      for(int j = 0; j < bucket_count; ++j) {
+                        if(transcripts[tid].read_coverage.size() < bucket_pos+j) std::cerr<<"here:"<<bucket_size << " " <<transcripts[tid].read_coverage.size() <<" "<< bucket_pos<<" "<<j<<" " << position << " " << transcripts[tid].RefLength << "\n";
+                        salmon::utils::incLoop(transcripts[tid].read_coverage[bucket_pos + j], -kv.second.assignedWeights[i + allWeights_iter]);
+                        salmon::utils::incLoop(transcripts[tid].read_coverage[bucket_pos + j], v * invDenom);
+                      }
+                      kv.second.assignedWeights[i + allWeights_iter] = v * invDenom;
+                    }
+
+                    if(std::isnan(v * invDenom)) std::cerr<<v << " " << invDenom << "\n"; //else std::cerr<<"v:"<<v << " " << i <<"\n";
+                  }
+                }
+                           allWeights_iter += groupSize;
+              }
+            }
+            else {
+                salmon::utils::incLoop(alphaOut[txps.front()], count);
+            }
+          }
+        }
+      });
+}
+
+
 template <typename VecT, typename EQVecT>
 size_t markDegenerateClasses(
     EQVecT& eqVec,
@@ -750,6 +864,7 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
   bool noRichEq = sopt.noRichEqClasses;
 
   bool useVBEM{sopt.useVBOpt};
+  bool useFMEM{sopt.useFMEMOpt};
   bool perTranscriptPrior{sopt.perTranscriptPrior};
   double priorValue{sopt.vbPrior};
 
@@ -916,8 +1031,9 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
         exit(1);
       }
     }
-
-    if (useVBEM) {
+    if (useFMEM) {
+      EMUpdate_FM(eqVec, transcripts, alphas, alphasPrime, sopt.bucket_size);
+    } else if (useVBEM) {
       VBEMUpdate_(eqVec, priorAlphas, alphas,
                   alphasPrime, expTheta);
     } else {

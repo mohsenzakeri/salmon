@@ -79,6 +79,10 @@ struct TGValue {
     weights = o.weights;
     combinedWeights = o.combinedWeights;
     count = o.count;
+    allWeights = o.allWeights;
+    startPositions = o.startPositions;
+    fragmentLengths = o.fragmentLengths;
+    assignedWeights = o.assignedWeights;
   }
 
   TGValue(){}
@@ -86,6 +90,10 @@ struct TGValue {
     weights = o.weights;
     combinedWeights = o.combinedWeights;
     count = o.count;
+    allWeights = o.allWeights;
+    startPositions = o.startPositions;
+    fragmentLengths = o.fragmentLengths;
+    assignedWeights = o.assignedWeights;
     //count.store(o.count.load());
     return *this;
   }
@@ -123,10 +131,13 @@ struct TGValue {
   }
 
   mutable std::vector<double> weights;
-
+  mutable std::vector<int32_t> startPositions;
+  mutable std::vector<int32_t> fragmentLengths;
+  mutable std::vector<double> assignedWeights;
   // The combined auxiliary and position weights.  These
   // are filled in by the inference algorithm.
   mutable std::vector<double> combinedWeights;
+  std::vector<double> allWeights;
   uint64_t count{0};
 };
 
@@ -205,7 +216,7 @@ public:
   // been called on the EquivalenceClassBuilder.
   inline size_t getNumTranscriptsForClass(size_t eqIdx) const;
 
-  inline void addGroup(TranscriptGroup&& g, std::vector<double>& weights);
+  inline void addGroup(TranscriptGroup&& g, std::vector<double>& weights, std::vector<int32_t>& starts, std::vector<int32_t>& lengths, const SalmonOpts& salmonOpts);
 
   inline void populateTargets(std::vector<std::vector<uint32_t>>& eqclasses,
                               std::vector<std::vector<double>>& auxs_vals,
@@ -234,16 +245,28 @@ private:
 
 template <>
 inline void EquivalenceClassBuilder<TGValue>::addGroup(TranscriptGroup&& g,
-                                                       std::vector<double>& weights) {
-  auto upfn = [&weights](TGValue& x) -> void {
+                                                       std::vector<double>& weights, std::vector<int32_t>& starts, std::vector<int32_t>& lengths, const SalmonOpts& salmonOpts) {
+  auto upfn = [&weights, &starts, &lengths, &salmonOpts](TGValue& x) -> void {
     // update the count
     x.count++;
     // update the weights
     for (size_t i = 0; i < x.weights.size(); ++i) {
       x.weights[i] += weights[i];
     }
+		if(salmonOpts.useFMEMOpt){
+			x.allWeights.insert(x.allWeights.end(), weights.begin(), weights.end());
+			x.startPositions.insert(x.startPositions.end(), starts.begin(), starts.end());
+			x.fragmentLengths.insert(x.fragmentLengths.end(), lengths.begin(), lengths.end());
+      for(int i=0; i<lengths.size();i++) x.assignedWeights.push_back(0);
+		}
   };
   TGValue v(weights, 1);
+	if(salmonOpts.useFMEMOpt) {
+		v.allWeights.insert(v.allWeights.end(), weights.begin(), weights.end());
+		v.startPositions.insert(v.startPositions.end(), starts.begin(), starts.end());
+		v.fragmentLengths.insert(v.fragmentLengths.end(), lengths.begin(), lengths.end());
+    for(int i=0; i<lengths.size();i++) v.assignedWeights.push_back(0);
+	}
   countMap_.upsert(g, upfn, v);
 }
 

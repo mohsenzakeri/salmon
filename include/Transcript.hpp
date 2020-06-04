@@ -44,6 +44,7 @@ public:
     uniqueCount_.store(0);
     totalCount_.store(0); // thanks @come-raczy
     cachedEffectiveLength_.store(salmon::math::LOG_0);
+    build_coverage_vector(bucket_size);
   }
 
   Transcript(size_t idIn, const char* name, uint32_t len, double alpha = 0.05)
@@ -54,6 +55,7 @@ public:
     uniqueCount_.store(0);
     totalCount_.store(0); // thanks @come-raczy
     cachedEffectiveLength_.store(std::log(static_cast<double>(RefLength)));
+    build_coverage_vector(bucket_size);
   }
 
   Transcript(size_t idIn, const char* name, double len, bool /*updateEffLength*/, double alpha = 0.05)
@@ -64,6 +66,12 @@ public:
     uniqueCount_.store(0);
     totalCount_.store(0); // thanks @come-raczy
     cachedEffectiveLength_.store(std::log(len));
+    build_coverage_vector(bucket_size);
+  }
+
+  void build_coverage_vector(uint32_t bucket_size) {
+    for(int i=0; i<RefLength/bucket_size+1;i++)
+      read_coverage.push_back(0);
   }
 
   // We cannot copy; only move
@@ -75,6 +83,7 @@ public:
 
     RefName = std::move(other.RefName);
     RefLength = other.RefLength;
+    read_coverage = other.read_coverage;
     CompleteLength = other.CompleteLength;
     EffectiveLength = other.EffectiveLength;
 
@@ -107,6 +116,7 @@ public:
 
     RefName = std::move(other.RefName);
     RefLength = other.RefLength;
+    read_coverage = other.read_coverage;
     CompleteLength = other.CompleteLength;
     EffectiveLength = other.EffectiveLength;
     SAMSequence_ = std::move(other.SAMSequence_);
@@ -496,6 +506,8 @@ public:
 
   std::string RefName;
   uint32_t RefLength;
+  std::vector<double> read_coverage;
+  double bucket_size{10.0};
   uint32_t CompleteLength;
   double EffectiveLength;
   uint32_t id;

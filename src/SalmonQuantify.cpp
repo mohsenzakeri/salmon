@@ -218,6 +218,7 @@ void processMiniBatch(ReadExperimentT& readExp, ForgettingMassCalculator& fmCalc
   bool useAuxParams = ((localNumAssignedFragments + numAssignedFragments) >=
                        salmonOpts.numPreBurninFrags);
 
+  bool useFMEM{salmonOpts.useFMEMOpt};
   bool singleEndLib = !readLib.isPairedEnd();
   bool modelSingleFragProb = !salmonOpts.noSingleFragProb;
 
@@ -302,6 +303,8 @@ void processMiniBatch(ReadExperimentT& readExp, ForgettingMassCalculator& fmCalc
 
       std::vector<uint32_t> txpIDs;
       std::vector<double> auxProbs;
+      std::vector<int32_t> startPositions;
+      std::vector<int32_t> fragmentLengths;
       double auxDenom = salmon::math::LOG_0;
 
       uint32_t numInGroup{0};
@@ -485,8 +488,13 @@ void processMiniBatch(ReadExperimentT& readExp, ForgettingMassCalculator& fmCalc
           // The bias probability
           double auxProb = logFragProb + logFragCov + logAlignCompatProb;
 
-          aln.logProb = transcriptLogCount + auxProb + startPosProb;
-
+          //aln.logProb = transcriptLogCount + auxProb + startPosProb;
+          if (useFMEM) {
+            auxProb += startPosProb;
+            aln.logProb = transcriptLogCount + auxProb;
+          } else {
+            aln.logProb = transcriptLogCount + auxProb + startPosProb;
+          }
           // If this alignment had a zero probability, then skip it
           if (std::abs(aln.logProb) == LOG_0) {
             continue;
@@ -507,6 +515,8 @@ void processMiniBatch(ReadExperimentT& readExp, ForgettingMassCalculator& fmCalc
           prevTxpID = transcriptID;
           txpIDs.push_back(transcriptID);
           auxProbs.push_back(auxProb);
+          startPositions.push_back(std::max(0,aln.hitPos()));
+          fragmentLengths.push_back(aln.fragLength());
           auxDenom = salmon::math::logAdd(auxDenom, auxProb);
         } else {
           aln.logProb = LOG_0;
@@ -555,7 +565,7 @@ void processMiniBatch(ReadExperimentT& readExp, ForgettingMassCalculator& fmCalc
           }
         }
 
-        if (rangeFactorization > 0) {
+        if (rangeFactorization > 0 and !useFMEM) {
           int32_t txpsSize = txpIDs.size();
           int32_t rangeCount = std::sqrt(txpsSize) + rangeFactorization;
 
@@ -566,7 +576,8 @@ void processMiniBatch(ReadExperimentT& readExp, ForgettingMassCalculator& fmCalc
         }
 
         TranscriptGroup tg(txpIDs);
-        eqBuilder.addGroup(std::move(tg), auxProbs);
+        //eqBuilder.addGroup(std::move(tg), auxProbs);
+        eqBuilder.addGroup(std::move(tg), auxProbs, startPositions, fragmentLengths, salmonOpts);
       }
 
       // normalize the hits
