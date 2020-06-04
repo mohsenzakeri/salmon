@@ -33,11 +33,6 @@
 #include <algorithm>
 
 
-// unnamed namespace only because the implementation is in this
-// header file and we don't want to export symbols to the obj files
-namespace
-{
-
 namespace tk
 {
 
@@ -48,33 +43,43 @@ private:
     std::vector< std::vector<double> > m_upper;  // upper band
     std::vector< std::vector<double> > m_lower;  // lower band
 public:
-    band_matrix() {};                             // constructor
-    band_matrix(int dim, int n_u, int n_l);       // constructor
-    ~band_matrix() {};                            // destructor
-    void resize(int dim, int n_u, int n_l);      // init with dim,n_u,n_l
-    int dim() const;                             // matrix dimension
-    int num_upper() const
+    inline band_matrix() = default;                             // constructor
+    inline band_matrix(int dim, int n_u, int n_l);       // constructor
+    inline void resize(int dim, int n_u, int n_l);      // init with dim,n_u,n_l
+    inline int dim() const;                             // matrix dimension
+    inline int num_upper() const
     {
         return m_upper.size()-1;
     }
-    int num_lower() const
+    inline int num_lower() const
     {
         return m_lower.size()-1;
     }
     // access operator
-    double & operator () (int i, int j);            // write
-    double   operator () (int i, int j) const;      // read
+    inline double & operator () (int i, int j);            // write
+    inline double   operator () (int i, int j) const;      // read
     // we can store an additional diogonal (in m_lower)
-    double& saved_diag(int i);
-    double  saved_diag(int i) const;
-    void lu_decompose();
-    std::vector<double> r_solve(const std::vector<double>& b) const;
-    std::vector<double> l_solve(const std::vector<double>& b) const;
-    std::vector<double> lu_solve(const std::vector<double>& b,
+    inline double& saved_diag(int i);
+    inline double  saved_diag(int i) const;
+    inline void lu_decompose();
+    inline std::vector<double> r_solve(const std::vector<double>& b) const;
+    inline std::vector<double> l_solve(const std::vector<double>& b) const;
+    inline std::vector<double> lu_solve(const std::vector<double>& b,
                                  bool is_lu_decomposed=false);
 
 };
 
+enum class spline_type {
+    linear = 1,
+    cubic = 3,
+    dflt = cubic
+};
+
+enum class extrapolation_method {
+   linear = 1,
+   quadratic = 2,
+   dflt = quadratic
+};
 
 // spline interpolation
 class spline
@@ -86,31 +91,26 @@ public:
     };
 
 private:
+    // find the closest point m_x[idx] < x, idx=0 even if x<m_x[0]
+    inline std::size_t closest_idx_to(double x) const;
+
     std::vector<double> m_x,m_y;            // x,y coordinates of points
     // interpolation parameters
     // f(x) = a*(x-x_i)^3 + b*(x-x_i)^2 + c*(x-x_i) + y_i
     std::vector<double> m_a,m_b,m_c;        // spline coefficients
     double  m_b0, m_c0;                     // for left extrapol
-    bd_type m_left, m_right;
-    double  m_left_value, m_right_value;
-    bool    m_force_linear_extrapolation;
 
 public:
-    // set default boundary condition to be zero curvature at both ends
-    spline(): m_left(second_deriv), m_right(second_deriv),
-        m_left_value(0.0), m_right_value(0.0),
-        m_force_linear_extrapolation(false)
-    {
-        ;
-    }
+    inline spline() = default;
+    inline spline(std::vector<double> xs, std::vector<double> ys,
+                  spline_type type = spline_type::dflt,
+                  extrapolation_method extrapolation = extrapolation_method::dflt,
+                  bd_type left = second_deriv, double left_value = 0.0,
+                  bd_type right = second_deriv, double right_value = 0.0);
 
     // optional, but if called it has to come be before set_points()
-    void set_boundary(bd_type left, double left_value,
-                      bd_type right, double right_value,
-                      bool force_linear_extrapolation=false);
-    void set_points(const std::vector<double>& x,
-                    const std::vector<double>& y, bool cubic_spline=true);
-    double operator() (double x) const;
+    inline double operator() (double x) const;
+    inline double deriv(int order, double x) const;
 };
 
 
@@ -263,75 +263,59 @@ std::vector<double> band_matrix::lu_solve(const std::vector<double>& b,
 }
 
 
-
-
 // spline implementation
 // -----------------------
 
-void spline::set_boundary(spline::bd_type left, double left_value,
-                          spline::bd_type right, double right_value,
-                          bool force_linear_extrapolation)
-{
-    assert(m_x.size()==0);          // set_points() must not have happened yet
-    m_left=left;
-    m_right=right;
-    m_left_value=left_value;
-    m_right_value=right_value;
-    m_force_linear_extrapolation=force_linear_extrapolation;
-}
-
-
-void spline::set_points(const std::vector<double>& x,
-                        const std::vector<double>& y, bool cubic_spline)
-{
-    assert(x.size()==y.size());
-    assert(x.size()>2);
-    m_x=x;
-    m_y=y;
-    int   n=x.size();
+inline spline::spline(std::vector<double> xs, std::vector<double> ys,
+                  spline_type type,
+                  extrapolation_method extrapolation,
+                  bd_type left, double left_value,
+                  bd_type right, double right_value)
+        : m_x(std::move(xs)), m_y(std::move(ys)) {
+    int n=m_x.size();
     // TODO: maybe sort x and y, rather than returning an error
     for(int i=0; i<n-1; i++) {
         assert(m_x[i]<m_x[i+1]);
     }
 
-    if(cubic_spline==true) { // cubic spline interpolation
+    if(type==spline_type::cubic) { // cubic spline interpolation
         // setting up the matrix and right hand side of the equation system
         // for the parameters b[]
         band_matrix A(n,1,1);
         std::vector<double>  rhs(n);
         for(int i=1; i<n-1; i++) {
-            A(i,i-1)=1.0/3.0*(x[i]-x[i-1]);
-            A(i,i)=2.0/3.0*(x[i+1]-x[i-1]);
-            A(i,i+1)=1.0/3.0*(x[i+1]-x[i]);
-            rhs[i]=(y[i+1]-y[i])/(x[i+1]-x[i]) - (y[i]-y[i-1])/(x[i]-x[i-1]);
+            A(i,i-1)=1.0/3.0*(m_x[i]-m_x[i-1]);
+            A(i,i)=2.0/3.0*(m_x[i+1]-m_x[i-1]);
+            A(i,i+1)=1.0/3.0*(m_x[i+1]-m_x[i]);
+            rhs[i]=(m_y[i+1]-m_y[i])/(m_x[i+1]-m_x[i]) - (m_y[i]-m_y[i-1])/(m_x[i]-m_x[i-1]);
         }
         // boundary conditions
-        if(m_left == spline::second_deriv) {
+        if(left == spline::second_deriv) {
             // 2*b[0] = f''
             A(0,0)=2.0;
             A(0,1)=0.0;
-            rhs[0]=m_left_value;
-        } else if(m_left == spline::first_deriv) {
+            rhs[0]=left_value;
+        } else if(left == spline::first_deriv) {
             // c[0] = f', needs to be re-expressed in terms of b:
-            // (2b[0]+b[1])(x[1]-x[0]) = 3 ((y[1]-y[0])/(x[1]-x[0]) - f')
-            A(0,0)=2.0*(x[1]-x[0]);
-            A(0,1)=1.0*(x[1]-x[0]);
-            rhs[0]=3.0*((y[1]-y[0])/(x[1]-x[0])-m_left_value);
+            // (2b[0]+b[1])(m_x[1]-m_x[0]) = 3 ((m_y[1]-m_y[0])/(m_x[1]-m_x[0]) - f')
+            A(0,0)=2.0*(m_x[1]-m_x[0]);
+            A(0,1)=1.0*(m_x[1]-m_x[0]);
+            rhs[0]=3.0*((m_y[1]-m_y[0])/(m_x[1]-m_x[0])-left_value);
         } else {
             assert(false);
         }
-        if(m_right == spline::second_deriv) {
+        if(right == spline::second_deriv) {
             // 2*b[n-1] = f''
             A(n-1,n-1)=2.0;
             A(n-1,n-2)=0.0;
-            rhs[n-1]=m_right_value;
-        } else if(m_right == spline::first_deriv) {
+            rhs[n-1]=right_value;
+        } else if(right == spline::first_deriv) {
             // c[n-1] = f', needs to be re-expressed in terms of b:
             // (b[n-2]+2b[n-1])(x[n-1]-x[n-2])
             // = 3 (f' - (y[n-1]-y[n-2])/(x[n-1]-x[n-2]))
-            A(n-1,n-1)=2.0*(x[n-1]-x[n-2]);
-            A(n-1,n-2)=1.0*(x[n-1]-x[n-2]);
-            rhs[n-1]=3.0*(m_right_value-(y[n-1]-y[n-2])/(x[n-1]-x[n-2]));
+            A(n-1,n-1)=2.0*(m_x[n-1]-m_x[n-2]);
+            A(n-1,n-2)=1.0*(m_x[n-1]-m_x[n-2]);
+            rhs[n-1]=3.0*(right_value-(m_y[n-1]-m_y[n-2])/(m_x[n-1]-m_x[n-2]));
         } else {
             assert(false);
         }
@@ -343,9 +327,9 @@ void spline::set_points(const std::vector<double>& x,
         m_a.resize(n);
         m_c.resize(n);
         for(int i=0; i<n-1; i++) {
-            m_a[i]=1.0/3.0*(m_b[i+1]-m_b[i])/(x[i+1]-x[i]);
-            m_c[i]=(y[i+1]-y[i])/(x[i+1]-x[i])
-                   - 1.0/3.0*(2.0*m_b[i]+m_b[i+1])*(x[i+1]-x[i]);
+            m_a[i]=1.0/3.0*(m_b[i+1]-m_b[i])/(m_x[i+1]-m_x[i]);
+            m_c[i]=(m_y[i+1]-m_y[i])/(m_x[i+1]-m_x[i])
+                   - 1.0/3.0*(2.0*m_b[i]+m_b[i+1])*(m_x[i+1]-m_x[i]);
         }
     } else { // linear interpolation
         m_a.resize(n);
@@ -359,28 +343,31 @@ void spline::set_points(const std::vector<double>& x,
     }
 
     // for left extrapolation coefficients
-    m_b0 = (m_force_linear_extrapolation==false) ? m_b[0] : 0.0;
+    m_b0 = (extrapolation==extrapolation_method::linear) ? m_b[0] : 0.0;
     m_c0 = m_c[0];
 
     // for the right extrapolation coefficients
     // f_{n-1}(x) = b*(x-x_{n-1})^2 + c*(x-x_{n-1}) + y_{n-1}
-    double h=x[n-1]-x[n-2];
+    double h=m_x[n-1]-m_x[n-2];
     // m_b[n-1] is determined by the boundary condition
     m_a[n-1]=0.0;
     m_c[n-1]=3.0*m_a[n-2]*h*h+2.0*m_b[n-2]*h+m_c[n-2];   // = f'_{n-2}(x_{n-1})
-    if(m_force_linear_extrapolation==true)
+    if(extrapolation==extrapolation_method::linear)
         m_b[n-1]=0.0;
+
+}
+
+std::size_t spline::closest_idx_to(double x) const {
+  const auto it=std::lower_bound(m_x.begin(),m_x.end(),x);
+  std::size_t idx=std::distance(m_x.begin(),it);
+  return idx == 0 ? 0 : idx - 1;
 }
 
 double spline::operator() (double x) const
 {
-    size_t n=m_x.size();
-    // find the closest point m_x[idx] < x, idx=0 even if x<m_x[0]
-    std::vector<double>::const_iterator it;
-    it=std::lower_bound(m_x.begin(),m_x.end(),x);
-    int idx=std::max( int(it-m_x.begin())-1, 0);
-
-    double h=x-m_x[idx];
+    const size_t n=m_x.size();
+    const std::size_t idx = closest_idx_to(x);
+    const double h=x-m_x[idx];
     double interpol;
     if(x<m_x[0]) {
         // extrapolation to the left
@@ -395,10 +382,62 @@ double spline::operator() (double x) const
     return interpol;
 }
 
+double spline::deriv(int order, double x) const
+{
+    assert(order>0);
+
+    const size_t n=m_x.size();
+    const std::size_t idx = closest_idx_to(x);
+    const double h=x-m_x[idx];
+    double interpol;
+    if(x<m_x[0]) {
+        // extrapolation to the left
+        switch(order) {
+        case 1:
+            interpol=2.0*m_b0*h + m_c0;
+            break;
+        case 2:
+            interpol=2.0*m_b0*h;
+            break;
+        default:
+            interpol=0.0;
+            break;
+        }
+    } else if(x>m_x[n-1]) {
+        // extrapolation to the right
+        switch(order) {
+        case 1:
+            interpol=2.0*m_b[n-1]*h + m_c[n-1];
+            break;
+        case 2:
+            interpol=2.0*m_b[n-1];
+            break;
+        default:
+            interpol=0.0;
+            break;
+        }
+    } else {
+        // interpolation
+        switch(order) {
+        case 1:
+            interpol=(3.0*m_a[idx]*h + 2.0*m_b[idx])*h + m_c[idx];
+            break;
+        case 2:
+            interpol=6.0*m_a[idx]*h + 2.0*m_b[idx];
+            break;
+        case 3:
+            interpol=6.0*m_a[idx];
+            break;
+        default:
+            interpol=0.0;
+            break;
+        }
+    }
+    return interpol;
+}
+
+
 
 } // namespace tk
-
-
-} // namespace
 
 #endif /* TK_SPLINE_H */

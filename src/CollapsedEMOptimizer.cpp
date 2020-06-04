@@ -1,6 +1,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <vector>
+#include <exception>
 
 #include "tbb/blocked_range.h"
 #include "tbb/parallel_for.h"
@@ -28,13 +29,15 @@
 #include "Transcript.hpp"
 #include "TranscriptGroup.hpp"
 #include "UnpairedRead.hpp"
+#include "EMUtils.hpp"
 
 using BlockedIndexRange = tbb::blocked_range<size_t>;
 
-// intelligently chosen value adopted from
+// intelligently chosen value originally adopted from
 // https://github.com/pachterlab/kallisto/blob/master/src/EMAlgorithm.h#L18
-constexpr double minEQClassWeight = std::numeric_limits<double>::denorm_min();
-constexpr double minWeight = std::numeric_limits<double>::denorm_min();
+// later modified since denorm_min seems to be too permissive.
+constexpr double minEQClassWeight = std::numeric_limits<double>::min();
+constexpr double minWeight = std::numeric_limits<double>::min();
 // A bit more conservative of a minimum as an argument to the digamma function.
 constexpr double digammaMin = 1e-10;
 
@@ -45,7 +48,7 @@ double normalize(std::vector<tbb::atomic<double>>& vec) {
   }
 
   // too small!
-  if (sum < minWeight) {
+  if (sum < ::minWeight) {
     return sum;
   }
 
@@ -55,20 +58,6 @@ double normalize(std::vector<tbb::atomic<double>>& vec) {
   }
 
   return sum;
-}
-
-template <typename VecT>
-double truncateCountVector(VecT& alphas, double cutoff) {
-  // Truncate tiny expression values
-  double alphaSum = 0.0;
-
-  for (size_t i = 0; i < alphas.size(); ++i) {
-    if (alphas[i] <= cutoff) {
-      alphas[i] = 0.0;
-    }
-    alphaSum += alphas[i];
-  }
-  return alphaSum;
 }
 
 template <typename VecT>
@@ -86,54 +75,26 @@ double truncateCountVector(VecT& alphas, std::vector<double>& cutoff) {
 }
 
 /**
- * Single-threaded EM-update routine for use in bootstrapping
+ *  Populate the prior parameters for the VBEM
+ *  Note: effLens *must* be valid before calling this function.
  */
-template <typename VecT>
-void EMUpdate_(std::vector<std::vector<uint32_t>>& txpGroupLabels,
-               std::vector<std::vector<double>>& txpGroupCombinedWeights,
-               std::vector<uint64_t>& txpGroupCounts,
-               std::vector<Transcript>& transcripts, const VecT& alphaIn,
-               VecT& alphaOut) {
+std::vector<double> populatePriorAlphas_(
+    std::vector<Transcript>& transcripts, // transcripts
+    Eigen::VectorXd& effLens,             // current effective length estimate
+    double priorValue,      // the per-nucleotide prior value to use
+    bool perTranscriptPrior // true if prior is per-txp, else per-nucleotide
+) {
+  // start out with the per-txp prior
+  std::vector<double> priorAlphas(transcripts.size(), priorValue);
 
-  assert(alphaIn.size() == alphaOut.size());
-
-  size_t numEqClasses = txpGroupLabels.size();
-  for (size_t eqID = 0; eqID < numEqClasses; ++eqID) {
-    uint64_t count = txpGroupCounts[eqID];
-    // for each transcript in this class
-    const std::vector<uint32_t>& txps = txpGroupLabels[eqID];
-    const auto& auxs = txpGroupCombinedWeights[eqID];
-
-    double denom = 0.0;
-    size_t groupSize = txps.size();
-    // If this is a single-transcript group,
-    // then it gets the full count.  Otherwise,
-    // update according to our VBEM rule.
-    if (BOOST_LIKELY(groupSize > 1)) {
-      for (size_t i = 0; i < groupSize; ++i) {
-        auto tid = txps[i];
-        auto aux = auxs[i];
-        double v = alphaIn[tid] * aux;
-        denom += v;
-      }
-
-      if (denom <= ::minEQClassWeight) {
-        // tgroup.setValid(false);
-      } else {
-        double invDenom = count / denom;
-        for (size_t i = 0; i < groupSize; ++i) {
-          auto tid = txps[i];
-          auto aux = auxs[i];
-          double v = alphaIn[tid] * aux;
-          if (!std::isnan(v)) {
-            salmon::utils::incLoop(alphaOut[tid], v * invDenom);
-          }
-        }
-      }
-    } else {
-      salmon::utils::incLoop(alphaOut[txps.front()], count);
+  // If the prior is per-nucleotide (default, then we need a potentially
+  // different value for each transcript based on its length).
+  if (!perTranscriptPrior) {
+    for (size_t i = 0; i < transcripts.size(); ++i) {
+      priorAlphas[i] = priorValue * effLens(i);
     }
   }
+  return priorAlphas;
 }
 
 /**
@@ -142,30 +103,31 @@ void EMUpdate_(std::vector<std::vector<uint32_t>>& txpGroupLabels,
 template <typename VecT>
 void VBEMUpdate_(std::vector<std::vector<uint32_t>>& txpGroupLabels,
                  std::vector<std::vector<double>>& txpGroupCombinedWeights,
-                 std::vector<uint64_t>& txpGroupCounts,
-                 std::vector<Transcript>& transcripts, std::vector<double>& priorAlphas,
-                 double totLen, const VecT& alphaIn, VecT& alphaOut,
-                 VecT& expTheta) {
+                 const std::vector<uint64_t>& txpGroupCounts,
+                 std::vector<double>& priorAlphas, 
+                 const VecT& alphaIn, VecT& alphaOut, VecT& expTheta) {
 
   assert(alphaIn.size() == alphaOut.size());
-
+  size_t M = alphaIn.size();
   size_t numEQClasses = txpGroupLabels.size();
   double alphaSum = {0.0};
-  for (auto& e : alphaIn) {
-    alphaSum += e;
+  for (size_t i = 0; i < M; ++i) {
+    alphaSum += alphaIn[i] + priorAlphas[i];
   }
 
   double logNorm = boost::math::digamma(alphaSum);
 
-  //double prior = priorAlpha;
+  // double prior = priorAlpha;
 
-  for (size_t i = 0; i < transcripts.size(); ++i) {
-    if (alphaIn[i] > ::digammaMin) {
-      expTheta[i] = std::exp(boost::math::digamma(alphaIn[i]) - logNorm);
+  for (size_t i = 0; i < M; ++i) {
+    auto ap = alphaIn[i] + priorAlphas[i];
+    if (ap > ::digammaMin) {
+        expTheta[i] =
+          std::exp(boost::math::digamma(ap) - logNorm);
     } else {
       expTheta[i] = 0.0;
     }
-    alphaOut[i] = priorAlphas[i];
+    alphaOut[i] = 0.0; // priorAlphas[i];
   }
 
   for (size_t eqID = 0; eqID < numEQClasses; ++eqID) {
@@ -173,12 +135,12 @@ void VBEMUpdate_(std::vector<std::vector<uint32_t>>& txpGroupLabels,
     const std::vector<uint32_t>& txps = txpGroupLabels[eqID];
     const auto& auxs = txpGroupCombinedWeights[eqID];
 
-    double denom = 0.0;
-    size_t groupSize = txps.size();
+    size_t groupSize = txpGroupCombinedWeights[eqID].size(); // txps.size();
     // If this is a single-transcript group,
     // then it gets the full count.  Otherwise,
     // update according to our VBEM rule.
     if (BOOST_LIKELY(groupSize > 1)) {
+      double denom = 0.0;
       for (size_t i = 0; i < groupSize; ++i) {
         auto tid = txps[i];
         auto aux = auxs[i];
@@ -212,8 +174,9 @@ void VBEMUpdate_(std::vector<std::vector<uint32_t>>& txpGroupLabels,
  * classes to estimate the latent variables (alphaOut)
  * given the current estimates (alphaIn).
  */
-void EMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
-               std::vector<Transcript>& transcripts,
+template <typename EQVecT>
+void EMUpdate_(EQVecT& eqVec,
+               std::vector<double>& priorAlphas,
                const CollapsedEMOptimizer::VecType& alphaIn,
                CollapsedEMOptimizer::VecType& alphaOut) {
 
@@ -221,7 +184,7 @@ void EMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
 
   tbb::parallel_for(
       BlockedIndexRange(size_t(0), size_t(eqVec.size())),
-      [&eqVec, &alphaIn, &alphaOut](const BlockedIndexRange& range) -> void {
+      [&eqVec, &priorAlphas, &alphaIn, &alphaOut](const BlockedIndexRange& range) -> void {
         for (auto eqID : boost::irange(range.begin(), range.end())) {
           auto& kv = eqVec[eqID];
 
@@ -232,16 +195,16 @@ void EMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
             const std::vector<uint32_t>& txps = tgroup.txps;
             const auto& auxs = kv.second.combinedWeights;
 
-            double denom = 0.0;
-            size_t groupSize = txps.size();
+            size_t groupSize = kv.second.weights.size(); // txps.size();
             // If this is a single-transcript group,
             // then it gets the full count.  Otherwise,
             // update according to our VBEM rule.
             if (BOOST_LIKELY(groupSize > 1)) {
+              double denom = 0.0;
               for (size_t i = 0; i < groupSize; ++i) {
                 auto tid = txps[i];
                 auto aux = auxs[i];
-                double v = alphaIn[tid] * aux;
+                double v = (alphaIn[tid]) * aux;
                 denom += v;
               }
 
@@ -252,7 +215,7 @@ void EMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
                 for (size_t i = 0; i < groupSize; ++i) {
                   auto tid = txps[i];
                   auto aux = auxs[i];
-                  double v = alphaIn[tid] * aux;
+                  double v = (alphaIn[tid]) * aux;
                   if (!std::isnan(v)) {
                     salmon::utils::incLoop(alphaOut[tid], v * invDenom);
                   }
@@ -271,37 +234,38 @@ void EMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
  * classes to estimate the latent variables (alphaOut)
  * given the current estimates (alphaIn).
  */
-void VBEMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
-                 std::vector<Transcript>& transcripts, std::vector<double>& priorAlphas,
-                 double totLen, const CollapsedEMOptimizer::VecType& alphaIn,
+template <typename EQVecT>
+void VBEMUpdate_(EQVecT& eqVec,
+                 std::vector<double>& priorAlphas, 
+                 const CollapsedEMOptimizer::VecType& alphaIn,
                  CollapsedEMOptimizer::VecType& alphaOut,
                  CollapsedEMOptimizer::VecType& expTheta) {
 
   assert(alphaIn.size() == alphaOut.size());
-
+  size_t M = alphaIn.size();
   double alphaSum = {0.0};
-  for (auto& e : alphaIn) {
-    alphaSum += e;
+  for (size_t i = 0; i < M; ++i) {
+    alphaSum += alphaIn[i] + priorAlphas[i];
   }
 
   double logNorm = boost::math::digamma(alphaSum);
 
-  tbb::parallel_for(BlockedIndexRange(size_t(0), size_t(transcripts.size())),
-                    [logNorm, totLen, &priorAlphas, &alphaIn, &alphaOut,
+  tbb::parallel_for(BlockedIndexRange(size_t(0), size_t(priorAlphas.size())),
+                    [logNorm, &priorAlphas, &alphaIn, &alphaOut,
                      &expTheta](const BlockedIndexRange& range) -> void {
 
-                      //double prior = priorAlpha;
+                      // double prior = priorAlpha;
 
                       for (auto i : boost::irange(range.begin(), range.end())) {
-                        if (alphaIn[i] > ::digammaMin) {
+                        auto ap = alphaIn[i].load() + priorAlphas[i];
+                        if (ap > ::digammaMin) {
                           expTheta[i] =
-                              std::exp(boost::math::digamma(alphaIn[i].load()) -
-                                       logNorm);
+                              std::exp(boost::math::digamma(ap) - logNorm);
                         } else {
                           expTheta[i] = 0.0;
                         }
-                        //alphaOut[i] = prior * transcripts[i].RefLength;
-                        alphaOut[i] = priorAlphas[i];
+                        // alphaOut[i] = prior * transcripts[i].RefLength;
+                        alphaOut[i] = 0.0;
                       }
                     });
 
@@ -319,12 +283,12 @@ void VBEMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
             const std::vector<uint32_t>& txps = tgroup.txps;
             const auto& auxs = kv.second.combinedWeights;
 
-            double denom = 0.0;
-            size_t groupSize = txps.size();
+            size_t groupSize = kv.second.weights.size(); // txps.size();
             // If this is a single-transcript group,
             // then it gets the full count.  Otherwise,
             // update according to our VBEM rule.
             if (BOOST_LIKELY(groupSize > 1)) {
+              double denom = 0.0;
               for (size_t i = 0; i < groupSize; ++i) {
                 auto tid = txps[i];
                 auto aux = auxs[i];
@@ -355,14 +319,13 @@ void VBEMUpdate_(std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
       });
 }
 
-template <typename VecT>
+template <typename VecT, typename EQVecT>
 size_t markDegenerateClasses(
-    std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
-    VecT& alphaIn, Eigen::VectorXd& effLens,
+    EQVecT& eqVec,
+    VecT& alphaIn, std::vector<bool>& available,
     std::shared_ptr<spdlog::logger> jointLog, bool verbose = false) {
 
   size_t numDropped{0};
-  size_t idx{0};
   for (auto& kv : eqVec) {
     uint64_t count = kv.second.count;
     // for each transcript in this class
@@ -371,7 +334,8 @@ size_t markDegenerateClasses(
     const auto& auxs = kv.second.combinedWeights;
 
     double denom = 0.0;
-    for (size_t i = 0; i < txps.size(); ++i) {
+    size_t groupSize = kv.second.weights.size();
+    for (size_t i = 0; i < groupSize; ++i) {
       auto tid = txps[i];
       auto aux = auxs[i];
       double v = alphaIn[tid] * aux;
@@ -382,7 +346,7 @@ size_t markDegenerateClasses(
                   << ", aux = " << aux << "\n";
       }
     }
-    if (denom <= minEQClassWeight) {
+    if (denom <= ::minEQClassWeight) {
       fmt::MemoryWriter errstream;
 
       errstream << "\nDropping weighted eq class\n";
@@ -406,12 +370,16 @@ size_t markDegenerateClasses(
       errstream << "}\n";
       errstream << "============================\n\n";
 
-      bool verbose{false};
       if (verbose) {
         jointLog->info(errstream.str());
       }
       ++numDropped;
       kv.first.setValid(false);
+    } else {
+      for (size_t i = 0; i < groupSize; ++i) {
+        auto tid = txps[i];
+        available[tid] = true;
+      }
     }
   }
   return numDropped;
@@ -423,13 +391,15 @@ bool doBootstrap(
     std::vector<std::vector<uint32_t>>& txpGroups,
     std::vector<std::vector<double>>& txpGroupCombinedWeights,
     std::vector<Transcript>& transcripts, Eigen::VectorXd& effLens,
-    std::vector<double>& sampleWeights, uint64_t totalNumFrags,
+    const std::vector<double>& sampleWeights, std::vector<uint64_t>& origCounts,
+    uint64_t totalNumFrags,
     uint64_t numMappedFrags, double uniformTxpWeight,
     std::atomic<uint32_t>& bsNum, SalmonOpts& sopt,
     std::vector<double>& priorAlphas,
     std::function<bool(const std::vector<double>&)>& writeBootstrap,
     double relDiffTolerance, uint32_t maxIter) {
 
+  // An EM termination criterion, adopted from Bray et al. 2016
   uint32_t minIter = 50;
 
   // Determine up front if we're going to use scaled counts.
@@ -447,11 +417,22 @@ bool doBootstrap(
   auto& jointLog = sopt.jointLog;
 
   std::random_device rd;
-  MultinomialSampler msamp(rd);
-
+  std::mt19937 gen(rd());
+  // MultinomialSampler msamp(rd);
+  std::discrete_distribution<uint64_t> csamp(sampleWeights.begin(),
+                                             sampleWeights.end());
   while (bsNum++ < numBootstraps) {
+    csamp.reset();
+
+    for (size_t sc = 0; sc < sampCounts.size(); ++sc) {
+      sampCounts[sc] = 0;
+    }
+    for (size_t fn = 0; fn < totalNumFrags; ++fn) {
+      ++sampCounts[csamp(gen)];
+    }
     // Do a new bootstrap
-    msamp(sampCounts.begin(), totalNumFrags, numClasses, sampleWeights.begin());
+    // msamp(sampCounts.begin(), totalNumFrags, numClasses,
+    // sampleWeights.begin());
 
     double totalLen{0.0};
     for (size_t i = 0; i < transcripts.size(); ++i) {
@@ -465,7 +446,9 @@ bool doBootstrap(
     size_t itNum = 0;
 
     // If we use VBEM, we'll need the prior parameters
-    //double priorAlpha = 1.00;
+    // double priorAlpha = 1.00;
+
+    // EM termination criteria, adopted from Bray et al. 2016
     double minAlpha = 1e-8;
     double alphaCheckCutoff = 1e-2;
     double cutoff = minAlpha;
@@ -473,10 +456,10 @@ bool doBootstrap(
     while (itNum < minIter or (itNum < maxIter and !converged)) {
 
       if (useVBEM) {
-        VBEMUpdate_(txpGroups, txpGroupCombinedWeights, sampCounts, transcripts,
-                    priorAlphas, totalLen, alphas, alphasPrime, expTheta);
+        VBEMUpdate_(txpGroups, txpGroupCombinedWeights, sampCounts, 
+                    priorAlphas, alphas, alphasPrime, expTheta);
       } else {
-        EMUpdate_(txpGroups, txpGroupCombinedWeights, sampCounts, transcripts,
+        EMUpdate_(txpGroups, txpGroupCombinedWeights, sampCounts, 
                   alphas, alphasPrime);
       }
 
@@ -498,22 +481,33 @@ bool doBootstrap(
       ++itNum;
     }
 
+    // Consider the projection of the abundances onto the *original* equivalence class
+    // counts
+    if (sopt.bootstrapReproject) {
+      if (useVBEM) {
+        VBEMUpdate_(txpGroups, txpGroupCombinedWeights, origCounts, 
+                    priorAlphas, alphas, alphasPrime, expTheta);
+      } else {
+        EMUpdate_(txpGroups, txpGroupCombinedWeights, origCounts, 
+                  alphas, alphasPrime);
+      }
+    }
+
     // Truncate tiny expression values
     double alphaSum = 0.0;
     if (useVBEM and !perTranscriptPrior) {
-        std::vector<double> cutoffs(transcripts.size(), 0.0);
-        for (size_t i = 0; i < transcripts.size(); ++i) {
-            cutoffs[i] = priorAlphas[i] + minAlpha;
-        }
-        //alphaSum = truncateCountVector(alphas, cutoffs);
-        alphaSum = truncateCountVector(alphas, cutoffs);
+      std::vector<double> cutoffs(transcripts.size(), 0.0);
+      for (size_t i = 0; i < transcripts.size(); ++i) {
+        cutoffs[i] = minAlpha;
+      }
+      // alphaSum = truncateCountVector(alphas, cutoffs);
+      alphaSum = truncateCountVector(alphas, cutoffs);
     } else {
-        // Truncate tiny expression values
-        alphaSum = truncateCountVector(alphas, cutoff);
+      // Truncate tiny expression values
+      alphaSum = truncateCountVector(alphas, cutoff);
     }
 
-
-    if (alphaSum < minWeight) {
+    if (alphaSum < ::minWeight) {
       jointLog->error("Total alpha weight was too small! "
                       "Make sure you ran salmon correclty.");
       return false;
@@ -540,6 +534,7 @@ bool doBootstrap(
             "have run salmon correctly and report this to GitHub.");
       }
     }
+
     writeBootstrap(alphas);
   }
   return true;
@@ -552,54 +547,46 @@ bool CollapsedEMOptimizer::gatherBootstraps(
     double relDiffTolerance, uint32_t maxIter) {
 
   std::vector<Transcript>& transcripts = readExp.transcripts();
+  std::vector<bool> available(transcripts.size(), false);
   using VecT = CollapsedEMOptimizer::SerialVecType;
   // With atomics
   VecT alphas(transcripts.size(), 0.0);
   VecT alphasPrime(transcripts.size(), 0.0);
   VecT expTheta(transcripts.size());
   Eigen::VectorXd effLens(transcripts.size());
+  double minAlpha = 1e-8;
 
   bool scaleCounts = (!sopt.useQuasi and !sopt.allowOrphans);
 
-  auto& fragStartDists = readExp.fragmentStartPositionDistributions();
   uint64_t numMappedFrags =
       scaleCounts ? readExp.upperBoundHits() : readExp.numMappedFragments();
 
   uint32_t numBootstraps = sopt.numBootstraps;
 
-  std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec =
-      readExp.equivalenceClassBuilder().eqVec();
+  auto& eqBuilder = readExp.equivalenceClassBuilder();
+  auto& eqVec = eqBuilder.eqVec();
 
   std::unordered_set<uint32_t> activeTranscriptIDs;
-  for (auto& kv : eqVec) {
-    auto& tg = kv.first;
-    for (auto& t : tg.txps) {
+  const size_t numClasses = eqVec.size();
+  for (size_t cid = 0; cid < numClasses; ++cid) { 
+    auto nt = eqBuilder.getNumTranscriptsForClass(cid);
+    auto& txps = eqVec[cid].first.txps;
+    for (size_t tctr = 0; tctr < nt; ++tctr) {
+      auto t = txps[tctr];
       transcripts[t].setActive();
       activeTranscriptIDs.insert(t);
     }
   }
 
-  bool useVBEM{sopt.useVBOpt};
   bool perTranscriptPrior{sopt.perTranscriptPrior};
   double priorValue{sopt.vbPrior};
-  
-  // If we use VBEM, we'll need the prior parameters
-  std::vector<double> priorAlphas(transcripts.size(), priorValue);
-  // If the prior is per-nucleotide (default, then we need a potentially different
-  // value for each transcript based on its length).
-  if (!perTranscriptPrior) {
-    for (size_t i = 0; i < transcripts.size(); ++i) {
-      priorAlphas[i] = priorValue * transcripts[i].RefLength;
-    }
-  }
-  //double priorAlpha = 1e-3;//1.00;
 
   auto jointLog = sopt.jointLog;
 
-  jointLog->info("Will draw {} bootstrap samples", numBootstraps);
-  jointLog->info("Optimizing over {} equivalence classes", eqVec.size());
+  jointLog->info("Will draw {:n} bootstrap samples", numBootstraps);
+  jointLog->info("Optimizing over {:n} equivalence classes", eqVec.size());
 
-  double totalNumFrags{static_cast<double>(readExp.numMappedFragments())};
+  double totalNumFrags{static_cast<double>(numMappedFrags)};
   double totalLen{0.0};
 
   if (activeTranscriptIDs.size() == 0) {
@@ -614,18 +601,18 @@ bool CollapsedEMOptimizer::gatherBootstraps(
     alphas[i] = transcripts[i].getActive() ? scale * totalNumFrags : 0.0;
     effLens(i) = (sopt.noEffectiveLengthCorrection)
                      ? transcripts[i].RefLength
-                     : std::exp(transcripts[i].getCachedLogEffectiveLength());
+                     : transcripts[i].EffectiveLength;
     totalLen += effLens(i);
   }
 
+  // If we use VBEM, we'll need the prior parameters
+  std::vector<double> priorAlphas = populatePriorAlphas_(
+      transcripts, effLens, priorValue, perTranscriptPrior);
+
   auto numRemoved =
-      markDegenerateClasses(eqVec, alphas, effLens, sopt.jointLog);
+      markDegenerateClasses(eqVec, alphas, available, sopt.jointLog);
   sopt.jointLog->info("Marked {} weighted equivalence classes as degenerate",
                       numRemoved);
-
-  size_t itNum{0};
-  double minAlpha = 1e-8;
-  double cutoff = minAlpha;
 
   // Since we will use the same weights and transcript groups for each
   // of the bootstrap samples (only the count vector will change), it
@@ -637,13 +624,27 @@ bool CollapsedEMOptimizer::gatherBootstraps(
   std::vector<uint64_t> origCounts;
   uint64_t totalCount{0};
 
-  for (auto& kv : eqVec) {
+  for (size_t cid = 0; cid < numClasses; ++cid) { 
+    const auto& kv = eqVec[cid];
     uint64_t count = kv.second.count;
+
     // for each transcript in this class
     const TranscriptGroup& tgroup = kv.first;
     if (tgroup.valid) {
-      const std::vector<uint32_t>& txps = tgroup.txps;
+      //const std::vector<uint32_t>& txps = tgroup.txps;
+      const auto numTranscripts = eqBuilder.getNumTranscriptsForClass(cid);
+      std::vector<uint32_t> txps(tgroup.txps.begin(), tgroup.txps.begin()+numTranscripts);
       const auto& auxs = kv.second.combinedWeights;
+      
+      if (txps.size() != auxs.size()) {
+        sopt.jointLog->critical(
+            "# of transcripts ({}) should match length of weight vec. ({})",
+            txps.size(), auxs.size());
+        sopt.jointLog->flush();
+        spdlog::drop_all();
+        std::exit(1);
+      }
+      
       txpGroups.push_back(txps);
       // Convert to non-atomic
       txpGroupCombinedWeights.emplace_back(auxs.begin(), auxs.end());
@@ -668,9 +669,10 @@ bool CollapsedEMOptimizer::gatherBootstraps(
   for (size_t tn = 0; tn < numWorkerThreads; ++tn) {
     workerThreads.emplace_back(
         doBootstrap, std::ref(txpGroups), std::ref(txpGroupCombinedWeights),
-        std::ref(transcripts), std::ref(effLens), std::ref(samplingWeights),
+        std::ref(transcripts), std::ref(effLens), std::ref(samplingWeights), std::ref(origCounts),
         totalCount, numMappedFrags, scale, std::ref(bsCounter), std::ref(sopt),
-	std::ref(priorAlphas), std::ref(writeBootstrap), relDiffTolerance, maxIter);
+        std::ref(priorAlphas), std::ref(writeBootstrap), relDiffTolerance,
+        maxIter);
   }
 
   for (auto& t : workerThreads) {
@@ -679,13 +681,13 @@ bool CollapsedEMOptimizer::gatherBootstraps(
   return true;
 }
 
+template <typename EQVecT>
 void updateEqClassWeights(
-    std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec,
-    Eigen::VectorXd& posWeightInvDenoms, Eigen::VectorXd& effLens) {
+    EQVecT& eqVec,
+    Eigen::VectorXd& effLens) {
   tbb::parallel_for(
       BlockedIndexRange(size_t(0), size_t(eqVec.size())),
-      [&eqVec, &effLens,
-       &posWeightInvDenoms](const BlockedIndexRange& range) -> void {
+      [&eqVec, &effLens](const BlockedIndexRange& range) -> void {
         // For each index in the equivalence class vector
         for (auto eqID : boost::irange(range.begin(), range.end())) {
           // The vector entry
@@ -693,19 +695,18 @@ void updateEqClassWeights(
           // The label of the equivalence class
           const TranscriptGroup& k = kv.first;
           // The size of the label
-          size_t classSize = k.txps.size();
+          size_t classSize = kv.second.weights.size(); // k.txps.size();
           // The weights of the label
-          TGValue& v = kv.second;
+          auto& v = kv.second;
 
           // Iterate over each weight and set it equal to
           // 1 / effLen of the corresponding transcript
           double wsum{0.0};
           for (size_t i = 0; i < classSize; ++i) {
             auto tid = k.txps[i];
-            v.posWeights[i] = 1.0 / effLens(tid);
+            auto probStartPos = 1.0 / effLens(tid);
             v.combinedWeights[i] =
-                kv.second.count *
-                (v.weights[i] * v.posWeights[i] * posWeightInvDenoms[tid]);
+                kv.second.count * (v.weights[i] * probStartPos);
             wsum += v.combinedWeights[i];
           }
           double wnorm = 1.0 / wsum;
@@ -722,11 +723,16 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
 
   tbb::task_scheduler_init tbbScheduler(sopt.numThreads);
   std::vector<Transcript>& transcripts = readExp.transcripts();
+  std::vector<bool> available(transcripts.size(), false);
 
+  // An EM termination criterion, adopted from Bray et al. 2016
   uint32_t minIter = 50;
   bool seqBiasCorrect = sopt.biasCorrect;
   bool gcBiasCorrect = sopt.gcBiasCorrect;
-  bool doBiasCorrect = seqBiasCorrect or gcBiasCorrect;
+  bool posBiasCorrect = sopt.posBiasCorrect;
+  bool doBiasCorrect = seqBiasCorrect or gcBiasCorrect or posBiasCorrect;
+  bool metaGenomeMode = sopt.meta;
+  bool altInitMode = sopt.alternativeInitMode;
 
   using VecT = CollapsedEMOptimizer::VecType;
   // With atomics
@@ -735,31 +741,15 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
   VecType expTheta(transcripts.size());
 
   Eigen::VectorXd effLens(transcripts.size());
-  Eigen::VectorXd posWeightInvDenoms(transcripts.size());
 
-  std::vector<std::pair<const TranscriptGroup, TGValue>>& eqVec =
+  auto& eqVec =
       readExp.equivalenceClassBuilder().eqVec();
 
   bool noRichEq = sopt.noRichEqClasses;
-  bool useFSPD{sopt.useFSPD};
 
   bool useVBEM{sopt.useVBOpt};
   bool perTranscriptPrior{sopt.perTranscriptPrior};
   double priorValue{sopt.vbPrior};
-  
-  // If we use VBEM, we'll need the prior parameters
-  std::vector<double> priorAlphas(transcripts.size(), priorValue);
-  // If the prior is per-nucleotide (default, then we need a potentially different
-  // value for each transcript based on its length).
-  if (!perTranscriptPrior) {
-    for (size_t i = 0; i < transcripts.size(); ++i) {
-      priorAlphas[i] = priorValue * transcripts[i].RefLength;
-    }
-  }
-
-  // If we use VBEM, we'll need the prior parameters
-  //double priorAlpha = 1e-3;//0.01;
-  //double priorAlpha = 1.0;
 
   auto jointLog = sopt.jointLog;
 
@@ -777,49 +767,49 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
   for (size_t i = 0; i < transcripts.size(); ++i) {
     auto& txp = transcripts[i];
     alphas[i] = txp.projectedCounts;
-
-
+    totalWeight += alphas[i];
     effLens(i) = useEffectiveLengths
                      ? std::exp(txp.getCachedLogEffectiveLength())
                      : txp.RefLength;
+    if (sopt.noLengthCorrection) {
+      effLens(i) = 100.0;
+    }
     txp.EffectiveLength = effLens(i);
 
-    if (txp.uniqueCount() > 0) {
-      totalWeight += txp.uniqueCount();
-      alphasPrime[i] = 1.0;
-      ++numActive;
-    } else {
-      totalWeight += 1e-3 * effLens(i);
-      alphasPrime[i] = 1.0;
-      ++numActive;
-    }
-
-    if (noRichEq or !useFSPD) {
-      posWeightInvDenoms(i) = 1.0;
-    } else {
-      auto& fragStartDist = fragStartDists[txp.lengthClassIndex()];
-      double denomFactor = fragStartDist.evalCDF(
-          static_cast<int32_t>(txp.EffectiveLength), txp.RefLength);
-      posWeightInvDenoms(i) = (denomFactor >= salmon::math::LOG_EPSILON)
-                                  ? std::exp(-denomFactor)
-                                  : (1e-5);
-    }
-
+    double uniqueCount = static_cast<double>(txp.uniqueCount() + 0.5);
+    auto wi = (sopt.initUniform) ? 100.0 : (uniqueCount * 1e-3 * effLens(i));
+    alphasPrime[i] = wi;
+    ++numActive;
     totalLen += effLens(i);
   }
+
+  // If we use VBEM, we'll need the prior parameters
+  std::vector<double> priorAlphas = populatePriorAlphas_(
+      transcripts, effLens, priorValue, perTranscriptPrior);
 
   // Based on the number of observed reads, use
   // a linear combination of the online estimates
   // and the uniform distribution.
   double uniformPrior = totalWeight / static_cast<double>(numActive);
-  // double fracObserved = 1.0;
-  double fracObserved = std::min(1.0, totalWeight / sopt.numRequiredFragments);
-  if (sopt.initUniform) { fracObserved = 0.0; }
-  for (size_t i = 0; i < alphas.size(); ++i) {
-    alphas[i] = (alphasPrime[i] == 1.0)
-                    ? ((alphas[i] * fracObserved) +
-                       (uniformPrior * (1.0 - fracObserved)))
-                    : 0.0;
+  double maxFrac = 0.999;
+  double fracObserved = std::min(maxFrac, totalWeight / sopt.numRequiredFragments);
+  // Above, we placed the uniformative (uniform) initalization into the
+  // alphasPrime variables.  If that's what the user requested, then copy those
+  // over to the alphas
+  if (sopt.initUniform) {
+    for (size_t i = 0; i < alphas.size(); ++i) {
+      alphas[i] = alphasPrime[i];
+      alphasPrime[i] = 1.0;
+    }
+  } else { // otherwise, initalize with a linear combination of the true and
+           // uniform alphas
+    for (size_t i = 0; i < alphas.size(); ++i) {
+      auto uniAbund = (metaGenomeMode or altInitMode) ? alphasPrime[i].load()
+                                                      : uniformPrior;
+      alphas[i] =
+          (alphas[i] * fracObserved) + (uniAbund * (1.0 - fracObserved));
+      alphasPrime[i] = 1.0;
+    }
   }
 
   // If the user requested *not* to use "rich" equivalence classes,
@@ -829,8 +819,7 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
   // by the effective length term.
   tbb::parallel_for(
       BlockedIndexRange(size_t(0), size_t(eqVec.size())),
-      [&eqVec, &effLens, &posWeightInvDenoms, useFSPD,
-       noRichEq](const BlockedIndexRange& range) -> void {
+      [&eqVec, &effLens, noRichEq, &sopt](const BlockedIndexRange& range) -> void {
         // For each index in the equivalence class vector
         for (auto eqID : boost::irange(range.begin(), range.end())) {
           // The vector entry
@@ -838,20 +827,12 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
           // The label of the equivalence class
           const TranscriptGroup& k = kv.first;
           // The size of the label
-          size_t classSize = k.txps.size();
+          size_t classSize = kv.second.weights.size(); // k.txps.size();
           // The weights of the label
-          TGValue& v = kv.second;
+          auto& v = kv.second;
 
           // Iterate over each weight and set it
           double wsum{0.0};
-
-          // If we don't have positional weights, then
-          // create them here.
-          bool createdPosWeights{false};
-          if (v.weights.size() != v.posWeights.size()) {
-            createdPosWeights = true;
-            v.posWeights = std::vector<tbb::atomic<double>>(v.weights.size());
-          }
 
           for (size_t i = 0; i < classSize; ++i) {
             auto tid = k.txps[i];
@@ -862,19 +843,14 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
             if (noRichEq) {
               // Keep length factor separate for the time being
               v.weights[i] = 1.0;
-              // Pos weight
-              v.posWeights[i] = 1.0 / el;
-            } else if (createdPosWeights or !useFSPD) {
-              // If the positional weights are new, then give them
-              // meaningful values.
-              v.posWeights[i] = 1.0 / el;
             }
+            // meaningful values.
+            auto probStartPos = 1.0 / el;
 
             // combined weight
-            v.combinedWeights.push_back(
-                v.weights[i].load() *
-                (v.posWeights[i].load() * posWeightInvDenoms[tid]));
-            wsum += v.combinedWeights.back();
+            double wt = sopt.eqClassMode ? v.weights[i] : v.count * v.weights[i] * probStartPos;
+            v.combinedWeights.push_back(wt);
+            wsum += wt;
           }
 
           double wnorm = 1.0 / wsum;
@@ -885,11 +861,13 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
       });
 
   auto numRemoved =
-      markDegenerateClasses(eqVec, alphas, effLens, sopt.jointLog);
+      markDegenerateClasses(eqVec, alphas, available, sopt.jointLog);
   sopt.jointLog->info("Marked {} weighted equivalence classes as degenerate",
                       numRemoved);
 
   size_t itNum{0};
+
+  // EM termination criteria, adopted from Bray et al. 2016
   double minAlpha = 1e-8;
   double alphaCheckCutoff = 1e-2;
   double cutoff = minAlpha;
@@ -897,49 +875,59 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
   // Iterations in which we will allow re-computing the effective lengths
   // if bias-correction is enabled.
   // std::vector<uint32_t> recomputeIt{100, 500, 1000};
-
   minIter = 100;
 
   bool converged{false};
   double maxRelDiff = -std::numeric_limits<double>::max();
   bool needBias = doBiasCorrect;
-  //bool secondPass = false;
   size_t targetIt{10};
-  
+  /* -- v0.8.x
+  double alphaSum = 0.0;
+  */
+
   while (itNum < minIter or (itNum < maxIter and !converged) or needBias) {
     if (needBias and (itNum > targetIt or converged)) {
 
-      jointLog->info("iteration {}, adjusting effective lengths to account for biases", itNum);
+      jointLog->info(
+          "iteration {:n}, adjusting effective lengths to account for biases",
+          itNum);
       effLens = salmon::utils::updateEffectiveLengths(sopt, readExp, effLens,
-                                                      alphas, true);
-      //(itNum == recomputeIt.front()));
+                                                      alphas, available, true);
+      // if we're doing the VB optimization, update the priors
+      if (useVBEM) {
+        priorAlphas = populatePriorAlphas_(transcripts, effLens, priorValue,
+                                           perTranscriptPrior);
+      }
 
       // Check for strangeness with the lengths.
-      for (size_t i = 0; i < effLens.size(); ++i) {
+      for (int32_t i = 0; i < effLens.size(); ++i) {
         if (effLens(i) <= 0.0) {
           jointLog->warn("Transcript {} had length {}", i, effLens(i));
         }
-        if (noRichEq or !useFSPD) {
-          posWeightInvDenoms(i) = 1.0;
-        } else {
-          auto& txp = transcripts[i];
-          auto& fragStartDist = fragStartDists[txp.lengthClassIndex()];
-          double denomFactor = fragStartDist.evalCDF(
-              static_cast<int32_t>(effLens(i)), txp.RefLength);
-          posWeightInvDenoms(i) = (denomFactor >= salmon::math::LOG_EPSILON)
-                                      ? std::exp(-denomFactor)
-                                      : 1e-5;
-        }
       }
-      updateEqClassWeights(eqVec, posWeightInvDenoms, effLens);
+      updateEqClassWeights(eqVec, effLens);
       needBias = false;
+
+      if ( sopt.eqClassMode ) {
+        jointLog->error("Eqclass Mode should not be performing bias correction");
+        jointLog->flush();
+        exit(1);
+      }
     }
 
     if (useVBEM) {
-      VBEMUpdate_(eqVec, transcripts, priorAlphas, totalLen, alphas, alphasPrime,
-                  expTheta);
+      VBEMUpdate_(eqVec, priorAlphas, alphas,
+                  alphasPrime, expTheta);
     } else {
-      EMUpdate_(eqVec, transcripts, alphas, alphasPrime);
+      /*
+      if (itNum > 0 and (itNum % 250 == 0)) {
+        for (size_t i = 0; i < transcripts.size(); ++i) {
+      	  if (alphas[i] < 1.0) { alphas[i] = 0.0; }
+      	}
+      }
+      */
+
+      EMUpdate_(eqVec, priorAlphas, alphas, alphasPrime);
     }
 
     converged = true;
@@ -956,33 +944,64 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
       alphasPrime[i] = 0.0;
     }
 
+    /* -- v0.8.x
+    if (converged and itNum > minIter and !needBias) {
+      if (useVBEM and !perTranscriptPrior) {
+        std::vector<double> cutoffs(transcripts.size(), 0.0);
+        for (size_t i = 0; i < transcripts.size(); ++i) {
+          cutoffs[i] = minAlpha;
+        }
+        alphaSum = truncateCountVector(alphas, cutoffs);
+      } else {
+        // Truncate tiny expression values
+        alphaSum = truncateCountVector(alphas, cutoff);
+      }
+      if (useVBEM) {
+        VBEMUpdate_(eqVec, priorAlphas, alphas,
+    alphasPrime, expTheta); } else { EMUpdate_(eqVec, transcripts, alphas,
+    alphasPrime);
+      }
+      for (size_t i = 0; i < transcripts.size(); ++i) {
+        alphas[i] = alphasPrime[i];
+        alphasPrime[i] = 0.0;
+      }
+    }
+    */
+
     if (itNum % 100 == 0) {
-      jointLog->info("iteration = {} | max rel diff. = {}", itNum, maxRelDiff);
+      jointLog->info("iteration = {:n} | max rel diff. = {}", itNum, maxRelDiff);
     }
 
     ++itNum;
   }
 
+  /* -- v0.8.x
+  if (alphaSum < ::minWeight) {
+    jointLog->error("Total alpha weight was too small! "
+                    "Make sure you ran salmon correclty.");
+    return false;
+  }
+  */
+
   // Reset the original bias correction options
   sopt.gcBiasCorrect = gcBiasCorrect;
   sopt.biasCorrect = seqBiasCorrect;
 
-  jointLog->info("iteration = {} | max rel diff. = {}", itNum, maxRelDiff);
+  jointLog->info("iteration = {:n} | max rel diff. = {}", itNum, maxRelDiff);
 
   double alphaSum = 0.0;
   if (useVBEM and !perTranscriptPrior) {
-      std::vector<double> cutoffs(transcripts.size(), 0.0);
-      for (size_t i = 0; i < transcripts.size(); ++i) {
-	cutoffs[i] = priorAlphas[i] + minAlpha;
-      }
-      //alphaSum = truncateCountVector(alphas, cutoffs);
-      alphaSum = truncateCountVector(alphas, cutoffs);
+    std::vector<double> cutoffs(transcripts.size(), 0.0);
+    for (size_t i = 0; i < transcripts.size(); ++i) {
+      cutoffs[i] = minAlpha;
+    }
+    alphaSum = truncateCountVector(alphas, cutoffs);
   } else {
-      // Truncate tiny expression values
-      alphaSum = truncateCountVector(alphas, cutoff);
+    // Truncate tiny expression values
+    alphaSum = truncateCountVector(alphas, cutoff);
   }
 
-  if (alphaSum < minWeight) {
+  if (alphaSum < ::minWeight) {
     jointLog->error("Total alpha weight was too small! "
                     "Make sure you ran salmon correclty.");
     return false;
@@ -1003,33 +1022,39 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
   return true;
 }
 
-template bool CollapsedEMOptimizer::optimize<ReadExperiment>(
-    ReadExperiment& readExp, SalmonOpts& sopt, double relDiffTolerance,
+using BulkReadExperimentT = ReadExperiment<EquivalenceClassBuilder<TGValue>>;
+template <typename FragT>
+using BulkAlnLibT = AlignmentLibrary<FragT, EquivalenceClassBuilder<TGValue>>;
+using SCReadExperimentT = ReadExperiment<EquivalenceClassBuilder<SCTGValue>>;
+
+
+template bool CollapsedEMOptimizer::optimize<BulkReadExperimentT>(
+    BulkReadExperimentT& readExp, SalmonOpts& sopt, double relDiffTolerance,
     uint32_t maxIter);
 
-template bool CollapsedEMOptimizer::optimize<AlignmentLibrary<UnpairedRead>>(
-    AlignmentLibrary<UnpairedRead>& readExp, SalmonOpts& sopt,
+template bool CollapsedEMOptimizer::optimize<BulkAlnLibT<UnpairedRead>>(
+    BulkAlnLibT<UnpairedRead>& readExp, SalmonOpts& sopt,
     double relDiffTolerance, uint32_t maxIter);
 
-template bool CollapsedEMOptimizer::optimize<AlignmentLibrary<ReadPair>>(
-    AlignmentLibrary<ReadPair>& readExp, SalmonOpts& sopt,
+template bool CollapsedEMOptimizer::optimize<BulkAlnLibT<ReadPair>>(
+    BulkAlnLibT<ReadPair>& readExp, SalmonOpts& sopt,
     double relDiffTolerance, uint32_t maxIter);
 
-template bool CollapsedEMOptimizer::gatherBootstraps<ReadExperiment>(
-    ReadExperiment& readExp, SalmonOpts& sopt,
+
+template bool CollapsedEMOptimizer::gatherBootstraps<BulkReadExperimentT>(
+    BulkReadExperimentT& readExp, SalmonOpts& sopt,
     std::function<bool(const std::vector<double>&)>& writeBootstrap,
     double relDiffTolerance, uint32_t maxIter);
 
 template bool
-CollapsedEMOptimizer::gatherBootstraps<AlignmentLibrary<UnpairedRead>>(
-    AlignmentLibrary<UnpairedRead>& readExp, SalmonOpts& sopt,
+CollapsedEMOptimizer::gatherBootstraps<BulkAlnLibT<UnpairedRead>>(
+    BulkAlnLibT<UnpairedRead>& readExp, SalmonOpts& sopt,
     std::function<bool(const std::vector<double>&)>& writeBootstrap,
     double relDiffTolerance, uint32_t maxIter);
 
 template bool
-CollapsedEMOptimizer::gatherBootstraps<AlignmentLibrary<ReadPair>>(
-    AlignmentLibrary<ReadPair>& readExp, SalmonOpts& sopt,
+CollapsedEMOptimizer::gatherBootstraps<BulkAlnLibT<ReadPair>>(
+    BulkAlnLibT<ReadPair>& readExp, SalmonOpts& sopt,
     std::function<bool(const std::vector<double>&)>& writeBootstrap,
     double relDiffTolerance, uint32_t maxIter);
-
 // Unused / old

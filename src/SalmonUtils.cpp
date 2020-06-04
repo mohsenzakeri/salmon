@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <boost/filesystem.hpp>
-#include <boost/filesystem.hpp>
 #include <boost/range/join.hpp>
 #include <boost/thread/thread.hpp>
 #include <fstream>
@@ -11,6 +10,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "json.hpp"
 #include "tbb/combinable.h"
 #include "tbb/parallel_for.h"
 
@@ -24,28 +24,36 @@
 #include "SBModel.hpp"
 #include "SalmonMath.hpp"
 #include "SalmonUtils.hpp"
-#include "UnpairedRead.hpp"
 #include "TryableSpinLock.hpp"
+#include "UnpairedRead.hpp"
+#include "TranscriptGroup.hpp"
+#include "Transcript.hpp"
 
-#include "spdlog/fmt/ostr.h"
 #include "spdlog/fmt/fmt.h"
+#include "spdlog/fmt/ostr.h"
 #include "spdlog/sinks/ostream_sink.h"
 #include "spdlog/spdlog.h"
 
 #include "gff.h"
 
+#include "FastxParser.hpp"
 #include "jellyfish/mer_dna.hpp"
-#include "jellyfish/stream_manager.hpp"
-#include "jellyfish/whole_sequence_parser.hpp"
 
 #include "GenomicFeature.hpp"
 #include "SGSmooth.hpp"
 #include "TranscriptGeneMap.hpp"
 
 #include "StadenUtils.hpp"
+#include "SalmonDefaults.hpp"
+
+#include "pufferfish/Util.hpp"
+
+#include "zstr.hpp"
 
 namespace salmon {
 namespace utils {
+
+  using MateStatus = pufferfish::util::MateStatus;
 
 std::string str(const MappingType& mt) {
   switch (mt) {
@@ -61,6 +69,8 @@ std::string str(const MappingType& mt) {
     return "mp";
   case MappingType::SINGLE_MAPPED:
     return "ms";
+  case MappingType::DECOY:
+    return "d";
   }
   // should never get here!
   return "E";
@@ -121,14 +131,11 @@ std::ostream& operator<<(std::ostream& os, OrphanStatus s) {
   return os;
 }
 
-bool isCompatible(const LibraryFormat observed,
-                  const LibraryFormat expected,
-                  int32_t start,
-                  bool isForward,
-                  rapmap::utils::MateStatus ms) {
+bool isCompatible(const LibraryFormat observed, const LibraryFormat expected,
+                  int32_t start, bool isForward, MateStatus ms) {
   // If we're dealing with a single end read.
   bool compat{false};
-  if (ms != rapmap::utils::MateStatus::PAIRED_END_PAIRED) {
+  if (ms != MateStatus::PAIRED_END_PAIRED) {
     compat = compatibleHit(expected, start, isForward, ms);
   } else {
     compat = compatibleHit(expected, observed);
@@ -138,11 +145,11 @@ bool isCompatible(const LibraryFormat observed,
 
 double logAlignFormatProb(const LibraryFormat observed,
                           const LibraryFormat expected, int32_t start,
-                          bool isForward, rapmap::utils::MateStatus ms,
+                          bool isForward, MateStatus ms,
                           double incompatPrior) {
   // If we're dealing with a single end read.
   bool compat{false};
-  if (ms != rapmap::utils::MateStatus::PAIRED_END_PAIRED) {
+  if (ms != MateStatus::PAIRED_END_PAIRED) {
     compat = compatibleHit(expected, start, isForward, ms);
   } else {
     compat = compatibleHit(expected, observed);
@@ -184,6 +191,7 @@ double logAlignFormatProb(const LibraryFormat observed,
 bool compatibleHit(const LibraryFormat expected, int32_t start, bool isForward,
                    MateStatus ms) {
   auto expectedStrand = expected.strandedness;
+  auto expectedType = expected.type;
   switch (ms) {
   case MateStatus::SINGLE_END:
     if (isForward) { // U, SF
@@ -194,32 +202,53 @@ bool compatibleHit(const LibraryFormat expected, int32_t start, bool isForward,
               expectedStrand == ReadStrandedness::A);
     }
     break;
+    // The next two cases are for *orphaned* PE reads
+
+    // This case is where the mapped read belongs to the "left" (i.e. 1) end
+    // of the pair.
   case MateStatus::PAIRED_END_LEFT:
     // "M"atching or same orientation is a special case
+    /*
+    if (expectedType == ReadType::SINGLE_END) {
+      return (expectedStrand == ReadStrandedness::U or
+              (expectedStrand == ReadStrandedness::S and isForward) or
+              (expectedStrand == ReadStrandedness::A and !isForward));
+    } else
+    */
     if (expected.orientation == ReadOrientation::SAME) {
       return (expectedStrand == ReadStrandedness::U or
               (expectedStrand == ReadStrandedness::S and isForward) or
               (expectedStrand == ReadStrandedness::A and !isForward));
     } else if (isForward) { // IU, ISF, OU, OSF, MU, MSF
       return (expectedStrand == ReadStrandedness::U or
-              expectedStrand == ReadStrandedness::S);
+              expectedStrand == ReadStrandedness::SA);
     } else { // IU, ISR, OU, OSR, MU, MSR
       return (expectedStrand == ReadStrandedness::U or
-              expectedStrand == ReadStrandedness::A);
+              expectedStrand == ReadStrandedness::AS);
     }
     break;
+
+    // This case is where the mapped read belongs to the "right" (i.e. 2) end
+    // of the pair.
   case MateStatus::PAIRED_END_RIGHT:
     // "M"atching or same orientation is a special case
+    /*
+    if (expectedType == ReadType::SINGLE_END) {
+      return (expectedStrand == ReadStrandedness::U or
+              (expectedStrand == ReadStrandedness::A and isForward) or
+              (expectedStrand == ReadStrandedness::S and !isForward));
+    } else
+    */
     if (expected.orientation == ReadOrientation::SAME) {
       return (expectedStrand == ReadStrandedness::U or
               (expectedStrand == ReadStrandedness::S and isForward) or
               (expectedStrand == ReadStrandedness::A and !isForward));
     } else if (isForward) { // IU, ISR, OU, OSR, MU, MSR
       return (expectedStrand == ReadStrandedness::U or
-              expectedStrand == ReadStrandedness::A);
+              expectedStrand == ReadStrandedness::AS);
     } else { // IU, ISF, OU, OSF, MU, MSF
       return (expectedStrand == ReadStrandedness::U or
-              expectedStrand == ReadStrandedness::S);
+              expectedStrand == ReadStrandedness::SA);
     }
     break;
   default:
@@ -272,7 +301,7 @@ void writeAbundancesFromCollapsed(const SalmonOpts& sopt, ExpLib& alnLib,
 
   // If we're using lightweight-alignment (FMD)
   // and not allowing orphans.
-  bool useScaledCounts = (!sopt.useQuasi and sopt.allowOrphans == false);
+  bool useScaledCounts = !(sopt.useQuasi or sopt.allowOrphans);
 
   std::unique_ptr<std::FILE, int (*)(std::FILE*)> output(
       std::fopen(fname.c_str(), "w"), std::fclose);
@@ -294,6 +323,9 @@ void writeAbundancesFromCollapsed(const SalmonOpts& sopt, ExpLib& alnLib,
     double refLength = sopt.noEffectiveLengthCorrection
                            ? transcript.RefLength
                            : std::exp(transcript.getCachedLogEffectiveLength());
+    if (sopt.noLengthCorrection) {
+      refLength = 100.0;
+    }
     tfracDenom += (transcript.projectedCounts / numMappedFrags) / refLength;
   }
 
@@ -306,10 +338,13 @@ void writeAbundancesFromCollapsed(const SalmonOpts& sopt, ExpLib& alnLib,
     double count = transcript.projectedCounts;
     double npm = (transcript.projectedCounts / numMappedFrags);
     double effLength = std::exp(logLength);
+    if (sopt.noLengthCorrection) {
+      effLength = 100.0;
+    }
     double tfrac = (npm / effLength) / tfracDenom;
     double tpm = tfrac * million;
     fmt::print(output.get(), "{}\t{}\t{}\t{}\t{}\n", transcript.RefName,
-               transcript.RefLength, effLength, tpm, count);
+               transcript.CompleteLength, effLength, tpm, count);
   }
 }
 
@@ -402,13 +437,10 @@ void writeAbundances(const SalmonOpts& sopt, ExpLib& alnLib,
     double logLength = sopt.noEffectiveLengthCorrection
                            ? std::log(transcript.RefLength)
                            : transcript.getCachedLogEffectiveLength();
-    /*
-    if (!sopt.noSeqBiasModel) {
-        double avgLogBias = transcript.getAverageSequenceBias(
-                            alnLib.sequenceBiasModel());
-        logLength += avgLogBias;
+    if (sopt.noLengthCorrection) {
+      logLength = 1.0;
     }
-    */
+
     // logLength = std::log(transcript.RefLength);
     double fpkmFactor = std::exp(logBillion - logLength - logNumFragments);
     double count = transcript.projectedCounts;
@@ -699,41 +731,96 @@ extractReadLibraries(boost::program_options::parsed_options& orderedOptions) {
     return (fmt.length() == 1 and (fmt.front() == 'a' or fmt.front() == 'A'));
   };
 
+  auto log = spdlog::get("jointLog");
+
+  bool sawLibType{false};
+  bool sawPairedLibrary{false};
+  bool sawUnpairedLibrary{false};
   bool autoLibType{false};
-  std::vector<ReadLibrary> peLibs{ReadLibrary(peFormat)};
-  std::vector<ReadLibrary> seLibs{ReadLibrary(seFormat)};
+
+  std::vector<ReadLibrary> peLibs{peFormat};
+  std::vector<ReadLibrary> seLibs{seFormat};
+
   for (auto& opt : orderedOptions.options) {
     // Update the library type
     if (opt.string_key == "libType") {
       if (!isAutoLibType(opt.value[0])) {
-	auto libFmt = parseLibraryFormatStringNew(opt.value[0]);
-	if (libFmt.type == ReadType::PAIRED_END) {
-	  peFormat = libFmt;
-	  peLibs.emplace_back(libFmt);
-	} else {
-	  seFormat = libFmt;
-	  seLibs.emplace_back(libFmt);
-	}
+        auto libFmt = parseLibraryFormatStringNew(opt.value[0]);
+        if (libFmt.type == ReadType::PAIRED_END) {
+          peFormat = libFmt;
+          peLibs.emplace_back(libFmt);
+        } else {
+          seFormat = libFmt;
+          seLibs.emplace_back(libFmt);
+        }
       } else {
-	autoLibType = true;
+        autoLibType = true;
       }
+      sawLibType = true;
     }
 
     if (opt.string_key == "mates1") {
+      if (!sawLibType) {
+        log->warn("Encountered a read file (--mates1/-1) before a "
+                  "library type specification.  The (--libType/-l) "
+                  "option must precede the input files.");
+        peLibs.clear();
+        return peLibs;
+      }
       peLibs.back().addMates1(opt.value);
-      if (autoLibType) { peLibs.back().enableAutodetect(); }
+      if (autoLibType) {
+        peLibs.back().enableAutodetect();
+      }
+      sawPairedLibrary = true;
     }
     if (opt.string_key == "mates2") {
+      if (!sawLibType) {
+        log->warn("Encountered a read file (--mates2/-2) before a "
+                  "library type specification.  The (--libType/-l) "
+                  "option must precede the input files.");
+        peLibs.clear();
+        return peLibs;
+      }
       peLibs.back().addMates2(opt.value);
-      if (autoLibType) { peLibs.back().enableAutodetect(); }
+      if (autoLibType) {
+        peLibs.back().enableAutodetect();
+      }
+      sawPairedLibrary = true;
     }
     if (opt.string_key == "unmatedReads") {
+      if (!sawLibType) {
+        log->warn("Encountered a read file (--unmatedReads/-r) before a "
+                  "library type specification.  The (--libType/-l) "
+                  "option must precede the input files.");
+        seLibs.clear();
+        return seLibs;
+      }
       seLibs.back().addUnmated(opt.value);
-      if (autoLibType) { seLibs.back().enableAutodetect(); }
+      if (autoLibType) {
+        seLibs.back().enableAutodetect();
+      }
+      sawUnpairedLibrary = true;
     }
   }
 
   std::vector<ReadLibrary> libs;
+
+  // @Avi : Allow this temporarily for now, since there is some use to hijack
+  // this behavior in Alevin.  However, we should figure out a proper parsing
+  // strategy for that rather than abusing single & PE library types.  Once we
+  // fix that, we should uncomment the below.
+  /*
+  if (sawPairedLibrary and sawUnpairedLibrary) {
+    log->warn("It seems you have specified both paired-end and unpaired read "
+              "libraries.  Salmon does not accepted mixed library types, and "
+              "different library types should typically not be quantified together "
+              "anyway.  Please quantifiy distinct library types separately.");
+    return libs;
+  }
+  */
+  (void)sawPairedLibrary;
+  (void)sawUnpairedLibrary;
+
   libs.reserve(peLibs.size() + seLibs.size());
   for (auto& lib : boost::range::join(seLibs, peLibs)) {
     if (lib.format().type == ReadType::SINGLE_END) {
@@ -749,14 +836,13 @@ extractReadLibraries(boost::program_options::parsed_options& orderedOptions) {
     }
     libs.push_back(lib);
   }
-  
-  auto log = spdlog::get("jointLog");
+
   size_t numLibs = libs.size();
   if (numLibs == 1) {
-      log->info("There is 1 library.");
+    log->info("There is 1 library.");
   } else if (numLibs > 1) {
-      log->info("There are {} libraries.", numLibs);
-  } 
+    log->info("There are {} libraries.", numLibs);
+  }
   return libs;
 }
 
@@ -852,55 +938,57 @@ LibraryFormat parseLibraryFormatString(std::string& fmt) {
   return lf;
 }
 
-  bool peekBAMIsPaired(const boost::filesystem::path& file) {
-    namespace bfs = boost::filesystem;
-    std::string readMode = "r";
-    
-    if (bfs::is_regular_file(file)) {
-      if (bfs::is_empty(file)) {
-	fmt::MemoryWriter errstr;
-	errstr << "file [" << file.string() << "] appears to be empty "
-	  "(i.e. it has size 0).  This is likely an error. "
-	  "Please re-run salmon with a corrected input file.\n\n";
-        throw std::invalid_argument(errstr.str());
-	return false;
-      }
-    }
-    if (file.extension() == ".bam") {
-      readMode = "rb";
-    }
+bool peekBAMIsPaired(const boost::filesystem::path& file) {
+  namespace bfs = boost::filesystem;
+  std::string readMode = "r";
 
-    auto* fp = scram_open(file.c_str(), readMode.c_str());
-
-    // If we couldn't open the file, then report this and exit.
-    if (fp == NULL) {
+  if (bfs::is_regular_file(file)) {
+    if (bfs::is_empty(file)) {
       fmt::MemoryWriter errstr;
-      errstr << "ERROR: Failed to open file " << file.string() << ", exiting!\n";
+      errstr << "file [" << file.string()
+             << "] appears to be empty "
+                "(i.e. it has size 0).  This is likely an error. "
+                "Please re-run salmon with a corrected input file.\n\n";
       throw std::invalid_argument(errstr.str());
       return false;
     }
-
-    bam_seq_t* read = nullptr;
-    read = staden::utils::bam_init();
-
-    bool didRead = (scram_get_seq(fp, &read) >= 0);
-    bool isPaired{false};
-    
-    if (didRead) {
-      isPaired = bam_flag(read) & BAM_FPAIRED;
-    } else {
-      fmt::MemoryWriter errstr;
-      errstr << "ERROR: Failed to read alignment from " << file.string() << ", exiting!\n";
-      staden::utils::bam_destroy(read);
-      throw std::invalid_argument(errstr.str());
-      return false;
-    }
-
-    scram_close(fp);
-    staden::utils::bam_destroy(read);
-    return isPaired;
   }
-  
+  if (file.extension() == ".bam") {
+    readMode = "rb";
+  }
+
+  auto* fp = scram_open(file.c_str(), readMode.c_str());
+
+  // If we couldn't open the file, then report this and exit.
+  if (fp == NULL) {
+    fmt::MemoryWriter errstr;
+    errstr << "ERROR: Failed to open file " << file.string() << ", exiting!\n";
+    throw std::invalid_argument(errstr.str());
+    return false;
+  }
+
+  bam_seq_t* read = nullptr;
+  read = staden::utils::bam_init();
+
+  bool didRead = (scram_get_seq(fp, &read) >= 0);
+  bool isPaired{false};
+
+  if (didRead) {
+    isPaired = bam_flag(read) & BAM_FPAIRED;
+  } else {
+    fmt::MemoryWriter errstr;
+    errstr << "ERROR: Failed to read alignment from " << file.string()
+           << ", exiting!\n";
+    staden::utils::bam_destroy(read);
+    throw std::invalid_argument(errstr.str());
+    return false;
+  }
+
+  scram_close(fp);
+  staden::utils::bam_destroy(read);
+  return isPaired;
+}
+
 uint64_t encode(uint64_t tid, uint64_t offset) {
   uint64_t res = (((tid & 0xFFFFFFFF) << 32) | (offset & 0xFFFFFFFF));
   return res;
@@ -983,6 +1071,9 @@ TranscriptGeneMap transcriptGeneMapFromGTF(const std::string& fname,
   using std::string;
   using std::get;
 
+  // Get the logger
+  auto logger = spdlog::get("jointLog");
+
   // Use GffReader to read the file
   GffReader reader(const_cast<char*>(fname.c_str()));
   // Remember the optional attributes
@@ -996,13 +1087,14 @@ TranscriptGeneMap transcriptGeneMapFromGTF(const std::string& fname,
   };
 
   // The user can group transcripts by gene_id, gene_name, or
-  // an optinal attribute that they provide as a string.
+  // an optional attribute that they provide as a string.
   enum class TranscriptKey { GENE_ID, GENE_NAME, DYNAMIC };
 
   // Select the proper attribute by which to group
   TranscriptKey tkey = TranscriptKey::GENE_ID;
 
   if (key == "gene_id") {
+    // This is the default initalization above.
   } else if (key == "gene_name") {
     tkey = TranscriptKey::GENE_NAME;
   } else {
@@ -1016,7 +1108,7 @@ TranscriptGeneMap transcriptGeneMapFromGTF(const std::string& fname,
   for (int i = 0; i < nfeat; ++i) {
     auto f = reader.gflst[i];
     if (f->isTranscript()) {
-      const char* keyStr;
+      const char* keyStr = nullptr;
       switch (tkey) {
       case TranscriptKey::GENE_ID:
         keyStr = f->getGeneID();
@@ -1028,7 +1120,17 @@ TranscriptGeneMap transcriptGeneMapFromGTF(const std::string& fname,
         keyStr = f->getAttr(key.c_str());
         break;
       }
-      feats.emplace_back(f->getID(), keyStr);
+      if (keyStr != nullptr and keyStr != NULL and f->hasGffID()) {
+        feats.emplace_back(f->getID(), keyStr);
+      } else {
+        if (!f->hasGffID()) {
+          logger->warn("Feature has no GFF ID");
+        }
+        if (keyStr == NULL) {
+          const char* fid = f->hasGffID() ? f->getID() : "NO_GFF_ID";
+          logger->warn("Could not find key for feature {}", fid);
+        }
+      }
     }
   }
 
@@ -1163,35 +1265,24 @@ TranscriptGeneMap readTranscriptToGeneMap(std::ifstream& ifile) {
 TranscriptGeneMap
 transcriptToGeneMapFromFasta(const std::string& transcriptsFile) {
   using std::vector;
-  using stream_manager = jellyfish::stream_manager<char**>;
-  using sequence_parser = jellyfish::whole_sequence_parser<stream_manager>;
+  using sequence_parser = fastx_parser::FastxParser<fastx_parser::ReadSeq>;
   namespace bfs = boost::filesystem;
 
   NameVector transcriptNames;
   NameVector geneNames{"gene"};
 
   vector<bfs::path> paths{transcriptsFile};
-
-  // Create a jellyfish parser
-  const int concurrentFile{1};
-  char** fnames = new char*[1];
-  fnames[0] = const_cast<char*>(transcriptsFile.c_str());
-  stream_manager streams(fnames, fnames + 1, concurrentFile);
-
   size_t maxReadGroupSize{100};
-  sequence_parser parser(4, maxReadGroupSize, concurrentFile, streams);
+  std::vector<std::string> readFiles{transcriptsFile};
+  sequence_parser parser(readFiles, 1, 1, maxReadGroupSize);
+  parser.start();
 
   // while there are transcripts left to process
-  while (true) {
-    sequence_parser::job j(parser);
-    // If this job is empty, then we're done
-    if (j.is_empty()) {
-      break;
-    }
-
-    for (size_t i = 0; i < j->nb_filled; ++i) {
+  auto rg = parser.getReadGroup();
+  while (parser.refill(rg)) {
+    for (auto& read : rg) {
       // The transcript name
-      std::string fullHeader(j->data[i].header);
+      std::string fullHeader(read.name);
       std::string header = fullHeader.substr(0, fullHeader.find(' '));
       transcriptNames.emplace_back(header);
     }
@@ -1263,10 +1354,420 @@ std::vector<std::string> split(const std::string& str,
   return result;
 }
 
+std::string getCurrentTimeAsString() {
+  // Get the current time as a string
+  std::time_t result = std::time(NULL);
+
+  // old non-threadsafe version
+  //auto time = std::string(std::asctime(std::localtime(&result)));
+  //time.pop_back(); // remove the newline
+  //return time;
+
+  struct tm local_tm;
+  // NOTE: localtime_r may not exist on windows systems.  This is OK
+  // as salmon doesn't support windows 
+  ::localtime_r(&result, &local_tm);
+  char buffer[80] = {0};
+  std::strftime(buffer, sizeof(buffer),"%a %b %d %H:%M:%S %Y", &local_tm);
+  std::string str(buffer);
+  return str;
+}
+
+  bool validateOptionsAlignment_(
+                                 SalmonOpts& sopt,
+                                 boost::program_options::variables_map& vm
+                                 ) {
+  if (!sopt.sampleOutput and sopt.sampleUnaligned) {
+    sopt.jointLog->warn(
+        "You passed in the (-u/--sampleUnaligned) flag, but did not request a "
+        "sampled "
+        "output file (-s/--sampleOut).  This flag will be ignored!");
+  }
+
+  if (sopt.useErrorModel and sopt.rangeFactorizationBins < 4) {
+    uint32_t nbins{4};
+    sopt.jointLog->info(
+                        "Usage of --useErrorModel implies use of range factorization. "
+                        "rangeFactorization bins is being set to {}", nbins
+                        );
+    sopt.rangeFactorizationBins = nbins;
+    sopt.useRangeFactorization = true;
+  }
+  return true;
+}
+
+  bool validateOptionsMapping_(
+                               SalmonOpts& sopt,
+                               boost::program_options::variables_map& vm
+                               ) {
+  auto numUnpaired = sopt.unmatedReadFiles.size();
+  auto numLeft = sopt.mate1ReadFiles.size();
+  auto numRight = sopt.mate2ReadFiles.size();
+
+  /** Info, not warnings or errors, but informative messages to the user **/
+  if (sopt.mimicBT2 or sopt.mimicStrictBT2 or sopt.hardFilter) {
+    sopt.jointLog->info("The --mimicBT2, --mimicStrictBT2 and --hardFilter flags imply mapping validation (--validateMappings). "
+                        "Enabling mapping validation.");
+    sopt.validateMappings = true;
+  }
+
+  // If not in alevin mode, inform the user about validateMappings
+  if (!sopt.alevinMode and !sopt.validateMappings) {
+    sopt.jointLog->warn("\n\n"
+                        "NOTE: It appears you are running salmon without the `--validateMappings` option.\n"
+                        "Mapping validation can generally improve both the sensitivity and specificity of mapping,\n"
+                        "with only a moderate increase in use of computational resources. \n"
+                        "Mapping validation is planned to become a default option (i.e. turned on by default) in\n"
+                        "the next release of salmon.\n"
+                        "Unless there is a specific reason to do this (e.g. testing on clean simulated data),\n"
+                        "`--validateMappings` is generally recommended.\n");
+  }
+
+  // currently there is some strange use for this in alevin, I think ...
+  // check with avi.
+  if (numLeft + numRight > 0 and numUnpaired > 0) {
+      sopt.jointLog->warn("You seem to have passed in both un-paired reads and paired-end reads. "
+                          "It is not currently possible to quantify hybrid library types in salmon.");
+  }
+
+
+  if (numLeft + numRight > 0) {
+    if (numLeft != numRight) {
+      sopt.jointLog->error("You passed paired-end files to salmon, but you passed {} files to --mates1 "
+                           "and {} files to --mates2.  You must pass the same number of files to both flags",
+                           numLeft, numRight);
+      return false;
+    }
+   }
+
+
+  auto checkScoreValue = [&sopt](int16_t score, std::string sname) -> bool {
+                           using score_t = int8_t;
+                           auto minval = static_cast<int16_t>(std::numeric_limits<score_t>::min());
+                           auto maxval = static_cast<int16_t>(std::numeric_limits<score_t>::max());
+                           if (score <  minval or score > maxval) {
+                             sopt.jointLog->error("You set the {} as {}, but it must be in "
+                                                  "the range [{}, {}].", sname, score, minval, maxval);
+                             return false;
+                           }
+                           return true;
+                         };
+
+  if(!checkScoreValue(sopt.matchScore, "match score")) { return false; }
+  if(!checkScoreValue(sopt.mismatchPenalty, "mismatch penalty")) { return false; }
+  if(!checkScoreValue(sopt.gapOpenPenalty, "gap open penalty")) { return false; }
+  if(!checkScoreValue(sopt.gapExtendPenalty, "gap extend penalty")) { return false; }
+
+  if (sopt.mismatchPenalty > 0) {
+    sopt.jointLog->warn(
+                        "You set the mismatch penalty as {}, but it should be negative.  It is being negated to {}.",
+                        sopt.mismatchPenalty, -sopt.mismatchPenalty);
+    sopt.mismatchPenalty = -sopt.mismatchPenalty;
+  }
+
+  // Make sure that consensusSlack is not negative
+  if (sopt.consensusSlack < 0 or sopt.consensusSlack >= 1.0) {
+    sopt.jointLog->error("You set consensusSlack as {}, but it must in [0,1).", sopt.consensusSlack);
+    return false;
+  }
+
+  if (sopt.mismatchSeedSkip < 1) {
+    sopt.jointLog->warn("The mismatchSeedSkip was set to {}, but it cannot be < 1.  Setting mismatchSeedSkip to 1");
+    sopt.mismatchSeedSkip = 1;
+  }
+
+  if (sopt.mismatchSeedSkip > 31) {
+    sopt.jointLog->warn("Setting the mismatchSeedSkip too high can hurt the sensitivity of mapping.  Consider "
+    "setting a lower mismatchSeedSkip.");
+  }
+
+  // If we have validate mappings, then make sure we automatically enable
+  // range factorization
+  if (sopt.validateMappings) {
+    if (!vm.count("minScoreFraction")) {
+      sopt.minScoreFraction = salmon::defaults::minScoreFraction;
+      sopt.jointLog->info(
+                          "Usage of --validateMappings implies use of minScoreFraction. "
+                          "Since not explicitly specified, it is being set to {}", sopt.minScoreFraction
+                          );
+    }
+
+    if (sopt.hardFilter) {
+      // range factorization doesn't make sense with hard filtering
+      if (sopt.rangeFactorizationBins > 0) {
+        sopt.jointLog->info("The use of range-factorized equivalence classes does not make sense "
+                            "in conjunction with --hardFilter.  Disabling range-factorized equivalence classes. ");
+        sopt.rangeFactorizationBins = 0;
+        sopt.useRangeFactorization = false;
+      }
+    } else if (sopt.rangeFactorizationBins < 4) {
+      uint32_t nbins{4};
+      sopt.jointLog->info(
+                          "Usage of --validateMappings, without --hardFilter implies use of range factorization. "
+                          "rangeFactorizationBins is being set to {}", nbins
+                          );
+      sopt.rangeFactorizationBins = nbins;
+      sopt.useRangeFactorization = true;
+    }
+
+    // If the consensus slack was not set explicitly, then it defaults to 0.2 with
+    // validateMappings
+    bool consensusSlackExplicit = !vm["consensusSlack"].defaulted();
+    if (!consensusSlackExplicit) {
+      sopt.consensusSlack = 0.35;
+      sopt.jointLog->info(
+                          "Usage of --validateMappings implies a default consensus slack of 0.2. "
+                          "Setting consensusSlack to {}.", sopt.consensusSlack);
+    }
+
+    if (sopt.mimicBT2 and sopt.mimicStrictBT2) {
+      sopt.jointLog->error("You passed both the --mimicBT2 and --mimicStrictBT2 parameters.  These are mutually exclusive. "
+                            "Please select only one of these flags.");
+      return false;
+    }
+
+    if (sopt.mimicBT2 or sopt.mimicStrictBT2) {
+      /*
+      sopt.jointLog->info("The --mimicBT2 and --mimicStrictBT2 flags imply orphan recovery (--recoverOrphans). "
+                          "Enabling orphan recovery.");
+      sopt.recoverOrphans = true;
+      */
+
+      sopt.maxReadOccs = 1000;
+      sopt.jointLog->info("The --mimicBT2 and --mimicStrictBT2 flags increases maxReadOccs to {}.", sopt.maxReadOccs);
+
+      sopt.consensusSlack = 0.5;
+      sopt.jointLog->info("The --mimicBT2 and --mimicStrictBT2 flags increases consensusSlack to {}.", sopt.consensusSlack);
+
+      if (sopt.mimicBT2) {
+        sopt.jointLog->info(
+                            "Usage of --mimicBT2 overrides other settings for mapping validation. Setting "
+                            "Bowtie2-like parameters now.");
+        sopt.discardOrphansQuasi = true;
+        if (sopt.softclipOverhangs) {
+          sopt.jointLog->info("Softclipping of overhangs is not allowed in mimicBT2 mode; setting to false.");
+          sopt.softclipOverhangs = false;
+        }
+
+        sopt.matchScore = 2;
+        sopt.mismatchPenalty = -4;
+        sopt.gapOpenPenalty = 5;
+        sopt.gapExtendPenalty = 3;
+        /*
+        sopt.matchScore = 0;
+        sopt.mismatchPenalty = -6;
+        sopt.gapOpenPenalty = 5;
+        sopt.gapExtendPenalty = 3;
+        */
+      }
+
+      if (sopt.mimicStrictBT2) {
+        sopt.jointLog->info(
+                            "Usage of --mimicStrictBT2 overrides other settings for mapping validation. Setting "
+                            "strict RSEM+Bowtie2-like parameters now.");
+        if (sopt.softclipOverhangs) {
+          sopt.jointLog->info("Softclipping of overhangs is not allowed in mimicStrictBT2 mode; setting to false.");
+          sopt.softclipOverhangs = false;
+        }
+        sopt.discardOrphansQuasi = true;
+        sopt.minScoreFraction = 0.8;
+        sopt.matchScore = 1;
+        sopt.mismatchPenalty = 0;
+        // NOTE: as a limitation of ksw2, we can't have
+        // (gapOpenPenalty + gapExtendPenalty) * 2 + matchScore < numeric_limits<int8_t>::max()
+        // these parameters below are sufficiently large penalties to
+        // prohibit gaps, while not overflowing the above condition
+        sopt.gapOpenPenalty = 25;
+        sopt.gapExtendPenalty = 25;
+      }
+    }
+  }
+  return true;
+}
+
 /**
- * Validate the options for quasi-mapping-based salmon, and create the necessary
- *output directories and
- * logging infrastructure.
+ * In mapping mode, depending on what the user has requested, we may have to
+ * write out some files.  Prepare loggers so we can do this asynchronously.
+ **/
+bool createAuxMapLoggers_(SalmonOpts& sopt,
+                          boost::program_options::variables_map& vm) {
+  using std::cerr;
+  using std::vector;
+  using std::string;
+  namespace bfs = boost::filesystem;
+
+  auto jointLog = sopt.jointLog;
+
+  // Create the file (and logger) for outputting unmapped reads, if the user has
+  // asked for it.
+  if (sopt.writeUnmappedNames) {
+    boost::filesystem::path auxDir = sopt.outputDirectory / sopt.auxDir;
+    bool auxSuccess = bfs::exists(auxDir) and bfs::is_directory(auxDir);
+    if (!auxSuccess) {
+      return false;
+    }
+    bfs::path unmappedNameFile = auxDir / "unmapped_names.txt";
+    std::ofstream* outFile = new std::ofstream(unmappedNameFile.string());
+    // Make sure file opened successfully.
+    if (!outFile->is_open()) {
+      jointLog->error("Could not create file for unmapped read names [{}]",
+                      unmappedNameFile.string());
+      delete outFile;
+      return false;
+    }
+    auto outputSink =
+        std::make_shared<spdlog::sinks::ostream_sink_mt>(*outFile);
+
+    std::shared_ptr<spdlog::logger> outLog =
+        std::make_shared<spdlog::logger>("unmappedLog", outputSink);
+    spdlog::register_logger(outLog);
+    outLog->set_pattern("%v");
+    sopt.unmappedFile.reset(outFile);
+    sopt.unmappedLog = outLog;
+  }
+
+  // Create the file (and logger) for outputting unmapped reads, if the user has
+  // asked for it.
+  if (sopt.writeOrphanLinks) {
+    boost::filesystem::path auxDir = sopt.outputDirectory / sopt.auxDir;
+    bool auxSuccess = bfs::exists(auxDir) and bfs::is_directory(auxDir);
+    if (!auxSuccess) {
+      return false;
+    }
+    bfs::path orphanLinkFile = auxDir / "orphan_links.txt";
+    std::ofstream* outFile = new std::ofstream(orphanLinkFile.string());
+    // Make sure file opened successfully.
+    if (!outFile->is_open()) {
+      jointLog->error("Could not create file for orphan links [{}]",
+                      orphanLinkFile.string());
+      delete outFile;
+      return false;
+    }
+
+    auto outputSink =
+        std::make_shared<spdlog::sinks::ostream_sink_mt>(*outFile);
+
+    std::shared_ptr<spdlog::logger> outLog =
+        std::make_shared<spdlog::logger>("orphanLinkLog", outputSink);
+    spdlog::register_logger(outLog);
+    outLog->set_pattern("%v");
+    sopt.orphanLinkFile.reset(outFile);
+    sopt.orphanLinkLog = outLog;
+  }
+
+  // Determine what we'll do with quasi-mapping results
+  bool writeQuasimappings = (sopt.qmFileName != "");
+
+  if (writeQuasimappings) {
+    std::streambuf* qmBuf{nullptr};
+    // output to stdout
+    if (sopt.qmFileName == "-") {
+      qmBuf = std::cout.rdbuf();
+    } else { // output to the requested path, making the directory if it doesn't
+             // exist
+      // get the absolute file path
+      sopt.qmFileName = boost::filesystem::absolute(sopt.qmFileName).string();
+      // get the parent directory
+      bfs::path qmDir = boost::filesystem::path(sopt.qmFileName).parent_path();
+      // if it's not already a directory that exists
+      bool qmDirSuccess = boost::filesystem::is_directory(qmDir);
+      // try to create it
+      if (!qmDirSuccess) {
+        qmDirSuccess = boost::filesystem::create_directories(qmDir);
+      }
+      // if the directory already existed, or we created it successfully, open
+      // the file
+      if (qmDirSuccess) {
+        sopt.qmFile.open(sopt.qmFileName);
+        // Make sure file opened successfully.
+        if (!sopt.qmFile.is_open()) {
+          jointLog->error(
+              "Could not create file for writing quasi-mappings [{}]",
+              sopt.qmFileName);
+          return false;
+        }
+        qmBuf = sopt.qmFile.rdbuf();
+      } else {
+        bfs::path qmFileName =
+            boost::filesystem::path(sopt.qmFileName).filename();
+        jointLog->error("Couldn't create requested directory {} in which "
+                        "to place the mapping output {}",
+                        qmDir.string(), qmFileName.string());
+        return false;
+      }
+    }
+    // Now set the output stream to the buffer, which is
+    // either std::cout, or a file.
+    sopt.qmStream.reset(new std::ostream(qmBuf));
+
+    auto outputSink = std::make_shared<spdlog::sinks::ostream_sink_mt>(
+        *(sopt.qmStream.get()));
+    sopt.qmLog = std::make_shared<spdlog::logger>("qmStream", outputSink);
+    sopt.qmLog->set_pattern("%v");
+  }
+  return true;
+}
+
+/**
+ *  Try to create the directory named by `dirPath`.  If it already
+ *  exists, make sure it is a directory.  If it already exists
+ *  but is not a directory, or if we are unable to create it, then
+ *  print an appropriate message to stderr.  This function returns
+ *  true if the directory was created successfully or already existed, and
+ *  false otherwise.
+ **/
+bool createDirectoryVerbose_(boost::filesystem::path& dirPath) {
+  namespace bfs = boost::filesystem;
+  if (bfs::exists(dirPath)) {
+    // If it already exists and isn't a directory, then complain
+    if (!bfs::is_directory(dirPath)) {
+      fmt::print(stderr,
+                 "{}ERROR{}: Path [{}] already exists "
+                 "and is not a directory.\n"
+                 "Please either remove this file or choose another "
+                 "auxiliary directory.\n",
+                 ioutils::SET_RED, ioutils::RESET_COLOR, dirPath);
+      return false;
+    }
+  } else { // If the path doesn't exist, then create it
+    if (!bfs::create_directories(dirPath)) { // creation failed for some reason
+      fmt::print(stderr,
+                 "{}ERROR{}: Could not create the directory [{}]. "
+                 "Please check that doing so is valid.",
+                 ioutils::SET_RED, ioutils::RESET_COLOR, dirPath);
+      return false;
+    }
+  }
+  return true;
+}
+
+
+/* Function used to check that 'opt1' and 'opt2' are not specified
+    at the same time. */
+// taken from : https://www.boost.org/doc/libs/1_67_0/libs/program_options/example/real.cpp
+void conflicting_options(const boost::program_options::variables_map& vm,
+                          const char* opt1, const char* opt2){
+  if (vm.count(opt1) && !vm[opt1].defaulted()
+      && vm.count(opt2) && !vm[opt2].defaulted()) {
+    throw std::logic_error(std::string("Conflicting options '")
+                           + opt1 + "' and '" + opt2 + "'.");
+  }
+}
+
+/* Function used to check that of 'for_what' is specified, then
+   'required_option' is specified too. */
+// taken from : https://www.boost.org/doc/libs/1_67_0/libs/program_options/example/real.cpp
+void option_dependency(const boost::program_options::variables_map& vm,
+                       const char* for_what, const char* required_option){
+  if (vm.count(for_what) && !vm[for_what].defaulted())
+    if (vm.count(required_option) == 0 || vm[required_option].defaulted())
+      throw std::logic_error(string("Option '") + for_what 
+                             + "' requires option '" + required_option + "'.");
+}
+
+/**
+ * Validate the options for salmon, and create the necessary
+ * output directories and logging infrastructure.
  **/
 bool processQuantOptions(SalmonOpts& sopt,
                          boost::program_options::variables_map& vm,
@@ -1280,9 +1781,7 @@ bool processQuantOptions(SalmonOpts& sopt,
   sopt.numBiasSamples.store(numBiasSamples);
 
   // Get the time at the start of the run
-  std::time_t result = std::time(NULL);
-  sopt.runStartTime = std::string(std::asctime(std::localtime(&result)));
-  sopt.runStartTime.pop_back(); // remove the newline
+  sopt.runStartTime = getCurrentTimeAsString();
 
   // Verify the geneMap before we start doing any real work.
   bfs::path geneMapPath;
@@ -1290,8 +1789,8 @@ bool processQuantOptions(SalmonOpts& sopt,
     // Make sure the provided file exists
     geneMapPath = vm["geneMap"].as<std::string>();
     if (!bfs::exists(geneMapPath)) {
-      std::cerr << "Could not find transcript <=> gene map file " << geneMapPath
-                << "\n";
+      std::cerr << "ERROR: Could not find transcript <=> gene map file "
+                << geneMapPath << "\n";
       std::cerr << "Exiting now: please either omit the \'geneMap\' option or "
                    "provide a valid file\n";
       return false;
@@ -1299,58 +1798,90 @@ bool processQuantOptions(SalmonOpts& sopt,
     sopt.geneMapPath = geneMapPath;
   }
 
+  /**
+   * Create some necessary directories
+   **/
+
+  // output directory
   bfs::path outputDirectory(vm["output"].as<std::string>());
-  bfs::create_directories(outputDirectory);
-  if (!(bfs::exists(outputDirectory) and bfs::is_directory(outputDirectory))) {
-    std::cerr << "Couldn't create output directory " << outputDirectory << "\n";
-    std::cerr << "exiting\n";
+  bool outputDirOK = createDirectoryVerbose_(outputDirectory);
+  // set the output directory
+  if (!outputDirOK) {
     return false;
   }
-
-  bfs::path indexDirectory(vm["index"].as<string>());
-  bfs::path logDirectory = outputDirectory / "logs";
-
-  sopt.indexDirectory = indexDirectory;
   sopt.outputDirectory = outputDirectory;
 
-  // Create the logger and the logging directory
-  bfs::create_directories(logDirectory);
-  if (!(bfs::exists(logDirectory) and bfs::is_directory(logDirectory))) {
-    std::cerr << "Couldn't create log directory " << logDirectory << "\n";
-    std::cerr << "exiting\n";
+  // log directory
+  bfs::path logDirectory = outputDirectory / "logs";
+  bool logDirOK = createDirectoryVerbose_(logDirectory);
+  if (!logDirOK) {
     return false;
   }
-
   if (!sopt.quiet) {
     std::cerr << "Logs will be written to " << logDirectory.string() << "\n";
   }
 
-  // Determine what we'll do with quasi-mapping results 
-  bool writeQuasimappings = (sopt.qmFileName != "");
+  // parameter directory
+  bfs::path paramsDir = outputDirectory / "libParams";
+  bool paramDirOK = createDirectoryVerbose_(paramsDir);
+  if (!paramDirOK) {
+    return false;
+  }
+  sopt.paramsDirectory = paramsDir;
 
+  // auxiliary directory
+  bfs::path auxDir = sopt.outputDirectory / sopt.auxDir;
+  bool auxDirOK = createDirectoryVerbose_(auxDir);
+  if (!auxDirOK) {
+    return false;
+  }
+  /** Done creating directories **/
+
+  // Metagenomic option
+  if (sopt.meta) {
+    sopt.initUniform = true;
+    sopt.noRichEqClasses = true;
+    // for now, meta mode uses the EM.
+    sopt.useEM = true;
+    sopt.useVBOpt = false;
+    // sopt.incompatPrior = salmon::math::LOG_0;
+    // sopt.ignoreIncompat = true;
+  }
+
+  //  Size for the logger buffer
+  size_t max_q_size = 131072; // 2097152;
   bfs::path logPath = logDirectory / "salmon_quant.log";
-  // must be a power-of-two
-  size_t max_q_size = 2097152;
-                      
-  // make it larger if we're writing mappings or 
-  // unmapped names.
-  std::streambuf* qmBuf;
-  if (writeQuasimappings or sopt.writeUnmappedNames) {
-      max_q_size = 16777216;
-  }  
+
+  if (sopt.quantMode == SalmonQuantMode::MAP) {
+    bfs::path indexDirectory(vm["index"].as<string>());
+    sopt.indexDirectory = indexDirectory;
+
+    // Determine what we'll do with quasi-mapping results
+    bool writeQuasimappings = (sopt.qmFileName != "");
+
+    // make it larger if we're writing mappings or
+    // unmapped names.
+    if (writeQuasimappings or sopt.writeUnmappedNames or
+        sopt.writeOrphanLinks) {
+      max_q_size = 2097152; // 4194304;//16777216;
+    }
+  }
 
   spdlog::set_async_mode(max_q_size);
-
-  auto fileSink = std::make_shared<spdlog::sinks::simple_file_sink_mt>(
-      logPath.string());
-  auto rawConsoleSink = std::make_shared<spdlog::sinks::stdout_sink_mt>();
+  auto fileSink =
+    std::make_shared<spdlog::sinks::simple_file_sink_mt>(logPath.string(), true);
+  // auto rawConsoleSink = std::make_shared<spdlog::sinks::stderr_sink_mt>();
+  // auto consoleSink =
+  //    std::make_shared<spdlog::sinks::ansicolor_sink>(rawConsoleSink);
   auto consoleSink =
-      std::make_shared<spdlog::sinks::ansicolor_sink>(rawConsoleSink);
+      std::make_shared<spdlog::sinks::ansicolor_stderr_sink_mt>();
   auto consoleLog = spdlog::create("stderrLog", {consoleSink});
   auto fileLog = spdlog::create("fileLog", {fileSink});
-  auto jointLog = spdlog::create("jointLog", {fileSink, consoleSink});
+  std::vector<spdlog::sink_ptr> sinks{consoleSink, fileSink};
+  auto jointLog =
+      spdlog::create("jointLog", std::begin(sinks), std::end(sinks));
 
-  // If we're being quiet, the only emit errors.
+  // If we're being quiet, then only emit errors.
   if (sopt.quiet) {
     jointLog->set_level(spdlog::level::err);
   }
@@ -1358,109 +1889,416 @@ bool processQuantOptions(SalmonOpts& sopt,
   sopt.jointLog = jointLog;
   sopt.fileLog = fileLog;
 
-  // Create the file (and logger) for outputting unmapped reads, if the user has
-  // asked for it.
-  if (sopt.writeUnmappedNames) {
-    boost::filesystem::path auxDir = sopt.outputDirectory / sopt.auxDir;
-    bool auxSuccess = boost::filesystem::is_directory(auxDir);
-    if (!auxSuccess) {
-      auxSuccess = boost::filesystem::create_directories(auxDir);
-    }
-    if (auxSuccess) {
-      bfs::path unmappedNameFile = auxDir / "unmapped_names.txt";
-      std::ofstream* outFile = new std::ofstream(unmappedNameFile.string());
-
-      // Must be a power of 2
-      //size_t queueSize{268435456};
-      //spdlog::set_async_mode(queueSize);
-      auto outputSink =
-          std::make_shared<spdlog::sinks::ostream_sink_mt>(*outFile);
-
-      std::shared_ptr<spdlog::logger> outLog =
-          std::make_shared<spdlog::logger>("unmappedLog", outputSink);
-      spdlog::register_logger(outLog);
-      outLog->set_pattern("%v");
-      sopt.unmappedFile.reset(outFile);
-    } else {
-      jointLog->error("Couldn't create auxiliary directory in which to place "
-                      "\"unmapped_names.txt\"");
-      return false;
+  if (sopt.quantMode == SalmonQuantMode::MAP) {
+    bool auxLoggersOK = createAuxMapLoggers_(sopt, vm);
+    if (!auxLoggersOK) {
+      return auxLoggersOK;
     }
   }
 
-  if (writeQuasimappings) {
-      // output to stdout
-      if (sopt.qmFileName == "-") {
-          qmBuf = std::cout.rdbuf();
-      } else { // output to the requested path, making the directory if it doesn't exist
-          // get the parent directory
-          bfs::path qmDir = boost::filesystem::path(sopt.qmFileName).parent_path();
-          // if it's not already a directory that exists
-          bool qmDirSuccess = boost::filesystem::is_directory(qmDir);
-          // try to create it
-          if (!qmDirSuccess) {
-              qmDirSuccess = boost::filesystem::create_directories(qmDir); 
-          }
-          // if the directory already existed, or we created it successfully, open the file
-          if (qmDirSuccess) {
-              sopt.qmFile.open(sopt.qmFileName);
-              qmBuf = sopt.qmFile.rdbuf();
-          } else {
-              bfs::path qmFileName = boost::filesystem::path(sopt.qmFileName).filename();
-              jointLog->error("Couldn't create requested directory {} in which "
-                              "to place the mapping output {}", qmDir.string(), qmFileName.string());
-              return false;
-          }
-      }
-      // Now set the output stream to the buffer, which is
-      // either std::cout, or a file.
-      sopt.qmStream.reset(new std::ostream(qmBuf));
-      
-      auto outputSink = std::make_shared<spdlog::sinks::ostream_sink_mt>(*(sopt.qmStream.get()));
-      sopt.qmLog = std::make_shared<spdlog::logger>("qmStream", outputSink);
-      sopt.qmLog->set_pattern("%v");
-  } 
+  /**
+   *  SETTING CONDITIONAL OPTIONS
+   *
+   *
+   **/
 
-  // Verify that no inconsistent options were provided
-  if (sopt.numGibbsSamples > 0 and sopt.numBootstraps > 0) {
-    jointLog->error("You cannot perform both Gibbs sampling and bootstrapping. "
-                    "Please choose one.");
-    jointLog->flush();
-    return false;
+  // If the user is using range factorization, set the appropriate parameters
+  // here
+  if (sopt.rangeFactorizationBins > 0) {
+    sopt.useRangeFactorization = true;
+  }
+
+  // If the user is enabling *just* GC bias correction
+  // i.e. without seq-specific bias correction, then disable
+  // the conditional model.
+  if (sopt.gcBiasCorrect and !sopt.biasCorrect) {
+    sopt.numConditionalGCBins = 1;
   }
 
   {
-    if (sopt.noFragLengthDist and !sopt.noEffectiveLengthCorrection) {
-      jointLog->info(
-          "Error: You cannot enable --noFragLengthDist without "
-          "also enabling --noEffectiveLengthCorrection; exiting!\n");
+    std::transform(sopt.hitFilterPolicyStr.begin(), sopt.hitFilterPolicyStr.end(),
+                   sopt.hitFilterPolicyStr.begin(), ::toupper);
+    if ( sopt.hitFilterPolicyStr == "BEFORE" ) {
+      sopt.hitFilterPolicy = pufferfish::util::HitFilterPolicy::FILTER_BEFORE_CHAINING;
+    } else if ( sopt.hitFilterPolicyStr == "AFTER" ) {
+      sopt.hitFilterPolicy = pufferfish::util::HitFilterPolicy::FILTER_AFTER_CHAINING;
+    } else if ( sopt.hitFilterPolicyStr == "BOTH" ) {
+      sopt.hitFilterPolicy = pufferfish::util::HitFilterPolicy::FILTER_BEFORE_AND_AFTER_CHAINING;
+    } else if ( sopt.hitFilterPolicyStr == "NONE" ) {
+      sopt.hitFilterPolicy = pufferfish::util::HitFilterPolicy::DO_NOT_FILTER;
+    } else {
+      jointLog->critical("The argument {} for --hitFilterPolicy is invalid. Valid options are "
+                         "BEFORE, AFTER, BOTH and NONE.", sopt.hitFilterPolicyStr);
       jointLog->flush();
       return false;
     }
   }
 
-  /** WARN about any deprecated options! **/
-  //
-  if (sopt.useFSPD) {
-    jointLog->error("The --useFSPD option has been deprecated.  "
-		    "Positional bias modeling will return under the --posBias flag in a future release. "
-		    "For the time being, please remove the --useFSPD flag from your command.");
-    jointLog->flush();
-    return false;
-  }
-  
-  // maybe arbitrary, but if it's smaller than this, consider it
-  // equal to LOG_0.
-  if (sopt.incompatPrior < 1e-320 or sopt.incompatPrior == 0.0) {
-      jointLog->info("Fragment incompatibility prior below threshold.  Incompatible fragments will be ignored.");
-      sopt.incompatPrior = salmon::math::LOG_0;
-      sopt.ignoreIncompat = true;
-  } else {
-      sopt.incompatPrior = std::log(sopt.incompatPrior);
-      sopt.ignoreIncompat = false;
+  // The growing list of thou shalt nots
+  {
+    try {
+      conflicting_options(vm, "validateMappings", "noSA");
+      conflicting_options(vm, "mimicBT2", "noSA");
+      conflicting_options(vm, "mimicStrictBT2", "noSA");
+      conflicting_options(vm, "hardFilter", "noSA");
+    } catch (std::logic_error& e) {
+      jointLog->critical(e.what());
+      jointLog->flush();
+      return false;
+    }
+
+    // currently, with the pufferfish based index
+    // we have not tested SA-free methods.  So let's
+    // disable this ability and give a warning.
+    if (sopt.disableSA) {
+      jointLog->critical("Note: Alignment-free mapping (i.e. mapping without subsequent selective-alignment) "
+                         "has not yet been throughly tested under the pufferfish-based index and using the "
+                         "pufferfish-based mapping strategies.  Thus, disabling of selective-alignment "
+                         "is not currently allowed.  We may, potentially explore re-enabling this option in future "
+                         "versions of salmon.");
+      jointLog->flush();
+      return false;
+      //sopt.validateMappings = false;
+    }
   }
 
+  {
+    try {
+      conflicting_options(vm, "useVBOpt", "useEM");
+    } catch (std::logic_error& e) {
+      jointLog->critical(e.what());
+      jointLog->flush();
+      return false;
+    }
+    // If the user passed useEM, but not useVBOpt, then
+    // turn off VB.  The fact that there is not a better
+    // way to handle this suggests a potential shortcoming
+    // of boost::program_options.
+    if(sopt.useEM) {
+      sopt.useVBOpt = false;
+    }
+  }
+
+  {
+    try {
+      conflicting_options(vm, "perNucleotidePrior", "perTranscriptPrior");
+    } catch (std::logic_error& e) {
+      jointLog->critical(e.what());
+      jointLog->flush();
+      return false;
+    }
+    // If the user passed perNucleotidePrior, then
+    // turn off perTranscriptPrior.
+    if(sopt.perNucleotidePrior) {
+      sopt.perTranscriptPrior = false;
+    }
+  }
+
+  // If we are in vbOpt mode, and using a perNucleotidePrior, and the user didn't change the default
+  // vbPrior, then divide this value by 1000.
+  if (sopt.useVBOpt and sopt.perNucleotidePrior and vm["vbPrior"].defaulted()) {
+    sopt.vbPrior = 1e-5;
+    jointLog->info("Using per-nucleotide prior with the default VB prior.  Setting the default prior to {}",sopt.vbPrior);
+  }
+
+  // If the maxHashResizeThreads was defaulted, then set it equal to the regular number 
+  // of threads.
+  if (vm["maxHashResizeThreads"].defaulted()) {
+    sopt.maxHashResizeThreads = sopt.numThreads;
+    jointLog->info("setting maxHashResizeThreads to {}", sopt.maxHashResizeThreads);
+  }
+
+  {
+    try {
+      conflicting_options(vm, "alignments", "eqclasses");
+    } catch (std::logic_error& e) {
+      jointLog->critical(e.what());
+      jointLog->flush();
+      return false;
+    }
+  }
+
+  {
+    try {
+      option_dependency(vm, "alignments", "targets");
+    } catch (std::logic_error& e) {
+      jointLog->critical(e.what());
+      jointLog->flush();
+      return false;
+    }
+  }
+
+  /** Warnings, not errors **/
+  {
+    if (sopt.numBurninFrags < sopt.numPreBurninFrags) {
+      sopt.jointLog->warn("You set the number of burnin fragments "
+                          "(--numAuxModelSamples) to be less than the number "
+                          "of \n"
+                          "pre-burnin fragments (--numPreAuxModelSamples), but "
+                          "it must be at least as large.  The \n"
+                          "number of pre-burnin fragments and burnin fragments "
+                          "is being set to the same value "
+                          "({})",
+                          sopt.numBurninFrags);
+      sopt.numPreBurninFrags = sopt.numBurninFrags;
+    }
+
+    // maybe arbitrary, but if it's smaller than this, consider it
+    // equal to LOG_0.
+    if (sopt.incompatPrior < 1e-100 or sopt.incompatPrior == 0.0) {
+      jointLog->info("Fragment incompatibility prior below threshold.  "
+                     "Incompatible fragments will be ignored.");
+      sopt.incompatPrior = salmon::math::LOG_0;
+      sopt.ignoreIncompat = true;
+    } else {
+      sopt.incompatPrior = std::log(sopt.incompatPrior);
+      sopt.ignoreIncompat = false;
+    }
+
+    // Dumping equivalnce class weights implies dumping equivalence classes
+    if (sopt.dumpEqWeights and !sopt.dumpEq) {
+      sopt.dumpEq = true;
+      jointLog->info("You specified --dumpEqWeights, which implies --dumpEq; "
+                     "that option has been enabled.");
+    }
+  }
+
+  /** Errors -- will prevent Salmon from running **/
+  {
+    if (sopt.numGibbsSamples > 0 and sopt.numBootstraps > 0) {
+      jointLog->critical(
+          "You cannot perform both Gibbs sampling and bootstrapping. "
+          "Please choose one.");
+      jointLog->flush();
+      return false;
+    }
+    if (sopt.numGibbsSamples > 0) {
+      if (!(sopt.thinningFactor >= 1)) {
+        jointLog->critical(
+            "The Gibbs sampling thinning factor (--thinningFactor) "
+            "cannot be smaller than 1.");
+        jointLog->flush();
+        return false;
+      }
+    }
+
+    if (sopt.noFragLengthDist and !sopt.noEffectiveLengthCorrection) {
+      jointLog->critical(
+          "You cannot enable --noFragLengthDist without "
+          "also enabling --noEffectiveLengthCorrection; exiting.");
+      jointLog->flush();
+      return false;
+    }
+
+    if (sopt.noLengthCorrection) {
+      bool anyBiasCorrect =
+          sopt.gcBiasCorrect or sopt.biasCorrect or sopt.posBiasCorrect;
+      if (anyBiasCorrect) {
+        jointLog->critical(
+            "Since bias correction relies on modifying "
+            "effective lengths, you cannot enable bias "
+            "correction simultaneously with the --noLengthCorrection "
+            "option.");
+        jointLog->flush();
+        return false;
+      }
+    }
+
+    if (sopt.dontExtrapolateCounts) { // If the user has provided this option,
+                                      // (s)he must be using Gibbs sampling
+      if (sopt.numGibbsSamples == 0) {
+        sopt.jointLog->critical("You passed the --noExtrapolateCounts flag, "
+                                "but are not using Gibbs sampling. "
+                                "The fomer implies the latter.  Please enable "
+                                "Gibbs sampling to use this flag.");
+        return false;
+      }
+    }
+  }
+  /** End of generic Error validation **/
+
+  // Validation that is different for alignment and mapping based modes.
+  bool perModeValidate{true};
+  if (sopt.quantMode == SalmonQuantMode::ALIGN) {
+    perModeValidate = validateOptionsAlignment_(sopt, vm);
+  } else if (sopt.quantMode == SalmonQuantMode::MAP) {
+    perModeValidate = validateOptionsMapping_(sopt, vm);
+  }
+
+  return perModeValidate;
+}
+
+// TODO: Check the use-case of this.  If we still want to support it, then update
+// it to read from a potentially gzipped equivalence class file.  Also, the eq file 
+// is in a non-standard format (effective lengths at the end), so get this info some
+// other way.
+bool readEquivCounts(boost::filesystem::path& eqFilePathString,
+                     std::vector<string>& tnames,
+                     std::vector<double>& tefflens,
+                     std::vector<std::vector<uint32_t>>& eqclasses,
+                     std::vector<std::vector<double>>& auxs_vals,
+                     std::vector<uint32_t>& eqclass_counts ) {
+
+  auto l = spdlog::get("jointLog");
+
+  namespace bfs = boost::filesystem;
+  bfs::path eqFilePath {eqFilePathString};
+
+  std::unique_ptr<std::istream> equivFilePtr = nullptr;
+  if (eqFilePath.extension() == ".gz") {
+    equivFilePtr.reset(new zstr::ifstream(eqFilePath.string()));
+  } else {
+    equivFilePtr.reset(new std::ifstream(eqFilePath.string()));
+  }
+  //std::ifstream equivFile(eqFilePath.string());
+
+  size_t numTxps, numEqClasses;
+  // Number of transcripts
+  (*equivFilePtr) >> numTxps;
+
+  // Number of equivalence classes
+  (*equivFilePtr) >> numEqClasses;
+
+  tnames.reserve(numTxps);
+  eqclasses.reserve(numEqClasses);
+  string tname;
+  std::unordered_map<string, size_t> nameToIndex;
+  for (size_t i = 0; i < numTxps; ++i) {
+    (*equivFilePtr) >> tname;
+    tnames.emplace_back(tname);
+    nameToIndex[tname] = i;
+  }
+
+  for (size_t i= 0; i < numEqClasses; ++i) {
+    size_t classLength;
+    (*equivFilePtr) >> classLength;
+
+    // each group member
+    uint64_t tid;
+    std::vector<uint32_t> tids; tids.reserve(classLength);
+    for (size_t i = 0; i < classLength; i++) {
+      (*equivFilePtr) >> tid;
+      tids.emplace_back(tid);
+    }
+
+    double aux;
+    std::vector<double> auxs; auxs.reserve(classLength);
+    for (size_t i = 0; i < classLength; i++) {
+      (*equivFilePtr) >> aux;
+      auxs.emplace_back(aux);
+    }
+
+    // count for this class
+    uint64_t count;
+    (*equivFilePtr) >> count;
+
+    eqclasses.emplace_back(tids);
+    auxs_vals.emplace_back(auxs);
+    eqclass_counts.emplace_back(count);
+  }
+
+  tefflens.resize(nameToIndex.size());
+  std::vector<size_t> indexList(nameToIndex.size());
+  std::iota(indexList.begin(), indexList.end(), 0);
+  std::unordered_set<size_t> indexSet(indexList.begin(), indexList.end());
+
+  double tlen;
+  while ((*equivFilePtr) >> tname >> tlen) {
+    size_t index {0};
+    auto it = nameToIndex.find(tname);
+    if ( it != nameToIndex.end() ) {
+      index = it->second;
+    } else {
+      l->warn("Missing effective lens for {}", it->first);
+      return false;
+    }
+
+    indexSet.erase(index);
+    tefflens[index] = tlen;
+  }
+
+  if (indexSet.size() > 0) {
+    l->warn("Missing effective lens for {} transcripts; setting to 100.0.", indexSet.size());
+    l->warn("NOTE: Since effective lengths are not provided, please do not rely on the TPM field \n"
+            "in the ouput quantifications.  Only the NumReads field will be reliable.");
+    for (auto& idx : indexSet) {
+      tefflens[idx] = 100.0;
+    }
+  }
+
+  //equivFile.close();
   return true;
+}
+
+/**
+ * @param sopt : The salmon options object that tells us the relevant files and contains the pointer 
+ *              to the logger object
+ * @param transcripts : The list of transcript objects
+ * 
+ * If the auxTargetFile is not empty (i.e. if the file exists), then read the auxiliary targets
+ * and mark them as such in the transcripts vector.  This function will also write a file containing
+ * the IDs of the targets marked as auxiliary to the file aux_target_ids.json in the `aux_info` directory.
+ **/
+void markAuxiliaryTargets(SalmonOpts& sopt, std::vector<Transcript>& transcripts) { 
+  
+  namespace bfs = boost::filesystem;
+  auto& log = sopt.jointLog;
+  const std::string& auxTargetFile = sopt.auxTargetFile;
+
+  // If the aux file is empty or doesn't exist
+  if (auxTargetFile == "") { 
+    return; 
+  } else if (!bfs::exists(auxTargetFile)) { 
+    log->warn("The auxiliary target file {}, does not exist.  No targets will be treated as auxiliary.", 
+               auxTargetFile);
+    return; 
+  }
+
+  std::ifstream auxFile(auxTargetFile);
+  if (!auxFile.good()) { 
+    log->warn("Could not open the auxiliary target file {}. No targets will be treated as auxiliary.",
+               auxTargetFile);
+    return;
+  }
+
+  spp::sparse_hash_set<std::string> auxTargetNames;
+  std::string tname;
+  while (auxFile >> tname) { auxTargetNames.insert(tname); }
+  auxFile.close();
+  log->info("Parsed {:n} auxiliary targets from {}", auxTargetNames.size(), auxTargetFile);
+
+  size_t tid = 0;
+  std::vector<size_t> auxIDs;
+  for (auto& txp : transcripts) {
+    bool isAux = auxTargetNames.contains(txp.RefName);
+    txp.setSkipBiasCorrection(isAux);
+    if (isAux) { auxIDs.push_back(tid); }
+    ++tid;
+  }
+  size_t numAuxFound = auxIDs.size();
+
+  if (numAuxFound != auxTargetNames.size()) {
+    log->warn("While {:n} auxiliary target names were found in {}, only {:n} were actually found "
+              "among tanscripts in the index.  Please make sure that the names in {} match the "
+              "transcript names in the index as expected.", auxTargetNames.size(), auxTargetFile, 
+              numAuxFound, auxTargetFile);
+  }
+
+  // write down the aux target ids in the output directory
+  bfs::path auxDir = sopt.outputDirectory / sopt.auxDir;
+  if (!bfs::exists(auxDir)) {
+    log->warn("The salmon aux directory {} did not exist.  Cannot write aux_target_ids.json!", auxDir);
+  }
+  bfs::path auxIDFilePath = sopt.outputDirectory / sopt.auxDir / "aux_target_ids.json";
+  std::ofstream auxIDFile(auxIDFilePath.string());
+  if (auxIDFile.is_open()) {
+    nlohmann::json o;
+    o["aux_target_ids"] = auxIDs;
+    auxIDFile << o;
+  } else {
+    log->warn("Could not properly open the aux_target_ids file {}.", auxIDFilePath.string());
+  }
+  auxIDFile.close();
 }
 
 /**
@@ -1476,14 +2314,19 @@ bool processQuantOptions(SalmonOpts& sopt,
  *     Genome Biol 12.3 (2011): R22.
  */
 template <typename AbundanceVecT, typename ReadExpT>
-Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
-                                       Eigen::VectorXd& effLensIn,
-                                       AbundanceVecT& alphas, bool writeBias) {
+Eigen::VectorXd
+updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
+                       Eigen::VectorXd& effLensIn, AbundanceVecT& alphas,
+                       std::vector<bool>& available, bool writeBias) {
 
   using std::vector;
   using BlockedIndexRange = tbb::blocked_range<size_t>;
+  using salmon::math::EPSILON;
+  using salmon::math::LOG_EPSILON;
 
+  // A read cutoff for a txp to be present, adopted from Bray et al. 2016
   double minAlpha = 1e-8;
+
   double minCDFMass = 1e-10;
   uint32_t gcSamp{sopt.pdfSampFactor};
   bool gcBiasCorrect{sopt.gcBiasCorrect};
@@ -1503,8 +2346,8 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
   // calculate read bias normalization factor -- total count in read
   // distribution.
   auto& obs5 = readExp.readBiasModelObserved(salmon::utils::Direction::FORWARD);
-  auto& obs3 =
-      readExp.readBiasModelObserved(salmon::utils::Direction::REVERSE_COMPLEMENT);
+  auto& obs3 = readExp.readBiasModelObserved(
+      salmon::utils::Direction::REVERSE_COMPLEMENT);
   obs5.normalize();
   obs3.normalize();
 
@@ -1577,10 +2420,13 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
    */
   class CombineableBiasParams {
   public:
-    CombineableBiasParams(uint32_t K, size_t numCondBins, size_t numGCBins) :
-      expectGC(numCondBins, numGCBins, distribution_utils::DistributionSpace::LINEAR) {
-      expectPos5 = std::vector<SimplePosBias>(5);
-      expectPos3 = std::vector<SimplePosBias>(5);
+    CombineableBiasParams(uint32_t K, size_t numCondBins, size_t numGCBins)
+        : expectGC(numCondBins, numGCBins,
+                   distribution_utils::DistributionSpace::LINEAR),
+          expectPos5(std::vector<SimplePosBias>(5)),
+          expectPos3(std::vector<SimplePosBias>(5)) {
+      //expectPos5 = std::vector<SimplePosBias>(5);
+      //expectPos3 = std::vector<SimplePosBias>(5);
     }
 
     std::vector<SimplePosBias> expectPos5;
@@ -1591,7 +2437,7 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
   };
 
   auto revComplement = [](const char* s, int32_t l, std::string& o) -> void {
-    if (l > o.size()) {
+    if (l > static_cast<int32_t>(o.size())) {
       o.resize(l, 'A');
     }
     int32_t j = 0;
@@ -1623,7 +2469,73 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
   int outsideContext{3};
   int insideContext{2};
 
+  /**
+   * New context counting
+   */
+
   int contextSize = outsideContext + insideContext;
+  // double cscale = 100.0 / (2 * contextSize);
+  auto populateContextCounts =
+      [outsideContext, insideContext, contextSize](
+          const Transcript& txp, const char* tseq,
+          Eigen::VectorXd& contextCountsFP, Eigen::VectorXd& contextCountsTP,
+          Eigen::VectorXd& windowLensFP, Eigen::VectorXd& windowLensTP) {
+        auto refLen = static_cast<int32_t>(txp.RefLength);
+        auto lastPos = refLen - 1;
+        if (refLen > contextSize) {
+          // window starts like this
+          // -3 === -2 === -1 === 0 === 1
+          //         3'           5'
+          // and then shifts to the right one base at a time.
+          int windowEnd = insideContext - 1;
+          int windowStart = -outsideContext;
+          int fp = 0;
+          int tp = windowStart + (insideContext - 1);
+          double count = txp.gcAt(windowEnd - 1);
+          for (; tp < refLen; ++fp, ++tp) {
+            if (windowStart > 0) {
+              switch (tseq[windowStart - 1]) {
+              case 'G':
+              case 'g':
+              case 'C':
+              case 'c':
+                count -= 1;
+              }
+            }
+            if (windowEnd < refLen) {
+              switch (tseq[windowEnd]) {
+              case 'G':
+              case 'g':
+              case 'C':
+              case 'c':
+                count += 1;
+              }
+            }
+            double actualWindowLength = (windowEnd < contextSize)
+                                            ? windowEnd + 1
+                                            : (windowEnd - windowStart + 1);
+            if (fp < refLen) {
+              contextCountsFP[fp] = count;
+              windowLensFP[fp] = actualWindowLength;
+            }
+            if (tp >= 0) {
+              contextCountsTP[tp] = count;
+              windowLensTP[tp] = actualWindowLength;
+            }
+            // Shift the end of the window right 1 base
+            if (windowEnd < refLen - 1) {
+              ++windowEnd;
+            }
+            ++windowStart;
+          }
+        }
+      };
+
+  /**
+   * orig context counting
+   **/
+  /*
+int contextSize = outsideContext + insideContext;
   double cscale = 100.0 / (2 * contextSize);
   auto populateContextCounts = [outsideContext, insideContext, contextSize](
       const Transcript& txp, const char* tseq, Eigen::VectorXd& contextCountsFP,
@@ -1666,17 +2578,18 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
       }
     }
   };
+  */
 
   /**
    * The local bias terms from each thread can be combined
    * via simple summation.
    */
   auto getBiasParams = [K, &sopt]() -> CombineableBiasParams {
-    return CombineableBiasParams(K, sopt.numConditionalGCBins, sopt.numFragGCBins);
+    return CombineableBiasParams(K, sopt.numConditionalGCBins,
+                                 sopt.numFragGCBins);
   };
   tbb::combinable<CombineableBiasParams> expectedDist(getBiasParams);
   std::atomic<size_t> numBackgroundTranscripts{0};
-  std::atomic<size_t> numExpressedTranscripts{0};
 
   tbb::parallel_for(
       BlockedIndexRange(size_t(0), size_t(transcripts.size())),
@@ -1694,6 +2607,10 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
 
           // Get the transcript
           const auto& txp = transcripts[it];
+
+          // If this transcript is in the list of transcripts for which the user 
+          // has requested we skip bias correction, then do so
+          if (txp.skipBiasCorrection()) { continue; }
 
           // Get the reference length and the
           // "initial" effective length (not considering any biases)
@@ -1717,11 +2634,7 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
 
           // Skip transcripts with trivial expression or that are too
           // short
-          if (alphas[it] < minAlpha or
-              unprocessedLen <= 0) { // or txp.uniqueUpdateFraction() < 0.90) {
-            if (alphas[it] >= minAlpha) {
-              ++numExpressedTranscripts;
-            }
+          if (alphas[it] < minAlpha or unprocessedLen <= 0) { // or txp.uniqueUpdateFraction() < 0.90) {
             continue;
           }
           ++numBackgroundTranscripts;
@@ -1731,8 +2644,12 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
 
           Eigen::VectorXd contextCountsFP(refLen);
           Eigen::VectorXd contextCountsTP(refLen);
-          contextCountsFP.setOnes();
-          contextCountsTP.setOnes();
+          Eigen::VectorXd windowLensFP(refLen);
+          Eigen::VectorXd windowLensTP(refLen);
+          contextCountsFP.setZero();
+          contextCountsTP.setZero();
+          windowLensFP.setZero();
+          windowLensTP.setZero();
 
           // This transcript's sequence
           const char* tseq = txp.Sequence();
@@ -1746,7 +2663,8 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
           int32_t contextLength{expectSeqFW.getContextLength()};
 
           if (gcBiasCorrect and seqBiasCorrect) {
-            populateContextCounts(txp, tseq, contextCountsFP, contextCountsTP);
+            populateContextCounts(txp, tseq, contextCountsFP, contextCountsTP,
+                                  windowLensFP, windowLensTP);
           }
 
           // The smallest and largest values of fragment
@@ -1789,9 +2707,21 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
                 if (fragEnd < refLen) {
                   // The GC fraction for this putative fragment
                   auto gcFrac = txp.gcFrac(fragStart, fragEnd);
+                  /*
                   int32_t contextFrac = std::lrint(
-                      (contextCountsFP[fragStart] + contextCountsTP[fragEnd]) *
-                      cscale);
+                                                   (contextCountsFP[fragStart] +
+                  contextCountsTP[fragEnd]) * cscale);
+                  */
+                  double contextLength =
+                      (windowLensFP[fragStart] + windowLensTP[fragEnd]);
+                  int32_t contextFrac =
+                      (contextLength > 0)
+                          ? (std::lrint(100.0 *
+                                        (contextCountsFP[fragStart] +
+                                         contextCountsTP[fragEnd]) /
+                                        contextLength))
+                          : 0;
+
                   GCDesc desc{gcFrac, contextFrac};
                   expectGC.inc(desc,
                                weight * (conditionalCDF(fl) - prevFLMass));
@@ -1808,11 +2738,11 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
               int32_t maxFragLenRC = fragStartPos;
               auto densityFW = conditionalCDF(maxFragLenFW);
               auto densityRC = conditionalCDF(maxFragLenRC);
-              if (weight * densityFW > 1e-8) {
+              if (weight * densityFW > EPSILON) {
                 expectPos5[txp.lengthClassIndex()].addMass(
                     fragStartPos, txp.RefLength, std::log(weight * densityFW));
               }
-              if (weight * densityRC > 1e-8) {
+              if (weight * densityRC > EPSILON) {
                 expectPos3[txp.lengthClassIndex()].addMass(
                     fragStartPos, txp.RefLength, std::log(weight * densityRC));
               }
@@ -1821,7 +2751,7 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
         }   // end for each transcript
 
       } // end tbb for function
-      );
+  );
 
   size_t bgCutoff =
       std::min(static_cast<size_t>(150),
@@ -1844,10 +2774,13 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
    * via simple summation.  Here, we combine the locally-computed
    * bias terms.
    */
-  SBModel exp5;
-  SBModel exp3;
-  std::vector<SimplePosBias> pos5Exp(5);
-  std::vector<SimplePosBias> pos3Exp(5);
+  SBModel& exp5 = readExp.readBiasModelExpected(salmon::utils::Direction::FORWARD);
+  SBModel& exp3 = readExp.readBiasModelExpected(salmon::utils::Direction::REVERSE_COMPLEMENT);
+
+  auto& pos5Exp = readExp.posBiasExpected(salmon::utils::Direction::FORWARD);
+  auto& pos3Exp =
+      readExp.posBiasExpected(salmon::utils::Direction::REVERSE_COMPLEMENT);
+
   auto combineBiasParams =
       [seqBiasCorrect, gcBiasCorrect, posBiasCorrect, &pos5Exp, &pos3Exp, &exp5,
        &exp3, &transcriptGCDist](const CombineableBiasParams& p) -> void {
@@ -1894,7 +2827,7 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
   size_t stepSize = static_cast<size_t>(transcripts.size() * 0.1);
   size_t nextUpdate{0};
 
-  //std::mutex updateMutex;
+  // std::mutex updateMutex;
   TryableSpinLock tsl;
   /**
    * Compute the effective lengths of each transcript (in parallel)
@@ -1931,9 +2864,10 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
           // lengths we'll consider for this transcript.
           int32_t locFLDLow = (refLen < cdfMaxArg) ? 1 : fldLow;
           int32_t locFLDHigh = (refLen < cdfMaxArg) ? cdfMaxArg : fldHigh;
-
-          if (alphas[it] >= minAlpha and unprocessedLen > 0 and
-              cdfMaxVal > minCDFMass) {
+          bool wasProcessed{false};
+          if (alphas[it] >= minAlpha
+              // available[it]
+              and unprocessedLen > 0 and cdfMaxVal > minCDFMass) {
 
             Eigen::VectorXd seqFactorsFW(refLen);
             Eigen::VectorXd seqFactorsRC(refLen);
@@ -1942,8 +2876,12 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
 
             Eigen::VectorXd contextCountsFP(refLen);
             Eigen::VectorXd contextCountsTP(refLen);
-            contextCountsFP.setOnes();
-            contextCountsTP.setOnes();
+            Eigen::VectorXd windowLensFP(refLen);
+            Eigen::VectorXd windowLensTP(refLen);
+            contextCountsFP.setZero();
+            contextCountsTP.setZero();
+            windowLensFP.setZero();
+            windowLensTP.setZero();
 
             std::vector<double> posFactorsFW(refLen, 1.0);
             std::vector<double> posFactorsRC(refLen, 1.0);
@@ -1958,8 +2896,8 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
             bool done{fl >= maxLen};
 
             if (gcBiasCorrect and seqBiasCorrect) {
-              populateContextCounts(txp, tseq, contextCountsFP,
-                                    contextCountsTP);
+              populateContextCounts(txp, tseq, contextCountsFP, contextCountsTP,
+                                    windowLensFP, windowLensTP);
             }
 
             if (posBiasCorrect) {
@@ -2018,21 +2956,20 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
             } // end sequence-specific factor calculation
 
             if (numProcessed > nextUpdate) {
-                if (tsl.try_lock()) {
-                    if (numProcessed > nextUpdate) {
-                        sopt.jointLog->info(
-                                            "processed bias for {:3.1f}% of the transcripts",
-                                            100.0 *
-                                            (numProcessed / static_cast<double>(numTranscripts)));
-                        nextUpdate += stepSize;
-                        if (nextUpdate > numTranscripts) {
-                            nextUpdate = numTranscripts - 1;
-                        }
-                    }
-                    tsl.unlock();
+              if (tsl.try_lock()) {
+                if (numProcessed > nextUpdate) {
+                  sopt.jointLog->info(
+                      "processed bias for {:3.1f}% of the transcripts",
+                      100.0 *
+                          (numProcessed / static_cast<double>(numTranscripts)));
+                  nextUpdate += stepSize;
+                  if (nextUpdate > numTranscripts) {
+                    nextUpdate = numTranscripts - 1;
+                  }
                 }
+                tsl.unlock();
+              }
             }
-            ++numProcessed;
 
             size_t sp = static_cast<size_t>((fl > 0) ? fl - 1 : 0);
             double prevFLMass = conditionalCDF(sp);
@@ -2060,10 +2997,22 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
                       seqFactorsFW[fragStart] * seqFactorsRC[fragEnd];
                   if (gcBiasCorrect) {
                     auto gcFrac = txp.gcFrac(fragStart, fragEnd);
+                    /*
                     int32_t contextFrac =
-                        std::lrint((contextCountsFP[fragStart] +
-                                    contextCountsTP[fragEnd]) *
-                                   cscale);
+                      std::lrint((contextCountsFP[fragStart] +
+                                  contextCountsTP[fragEnd]) *
+                                 cscale);
+                    */
+                    double contextLength =
+                        (windowLensFP[fragStart] + windowLensTP[fragEnd]);
+                    int32_t contextFrac =
+                        (contextLength > 0)
+                            ? (std::lrint(100.0 *
+                                          (contextCountsFP[fragStart] +
+                                           contextCountsTP[fragEnd]) /
+                                          contextLength))
+                            : 0;
+
                     GCDesc desc{gcFrac, contextFrac};
                     fragFactor *= gcBias.get(desc);
                     /*
@@ -2083,35 +3032,34 @@ Eigen::VectorXd updateEffectiveLengths(SalmonOpts& sopt, ReadExpT& readExp,
               effLength += (flWeight * flMassTotal);
               fl += gcSamp;
             }
+            wasProcessed = true;
           } // for the processed transcript
 
-          // throw caution to the wind
-          double thresh = noThreshold ? 1.0 : unprocessedLen;
-
-          if (noThreshold) {
-            if (unprocessedLen > 0.0 and effLength > thresh) {
-              effLensOut(it) = effLength;
+          if (wasProcessed) {
+            // throw caution to the wind
+            double thresh = noThreshold ? 1.0 : unprocessedLen;
+            if (noThreshold) {
+              if (unprocessedLen > 0.0 and effLength > thresh) {
+                effLensOut(it) = effLength;
+              } else {
+                effLensOut(it) = effLensIn(it);
+              }
             } else {
-              effLensOut(it) = effLensIn(it);
+              double offset = std::max(1.0, thresh);
+              double effLengthNoBias = static_cast<double>(elen);
+              auto barrierLength = [effLengthNoBias, offset](double x) -> double {
+                                     return std::max(x, std::min(effLengthNoBias, offset));
+                                   };
+              effLensOut(it) = barrierLength(effLength);
             }
           } else {
-            double offset = std::max(1.0, thresh);
-            double effLengthNoBias = static_cast<double>(elen);
-            auto barrierLength = [effLengthNoBias, offset](double x) -> double {
-              return std::max(x, std::min(effLengthNoBias, offset));
-            };
-            effLensOut(it) = barrierLength(effLength);
+            effLensOut(it) = static_cast<double>(elen);
           }
+          ++numProcessed;
         }
       } // end parallel_for lambda
-      );
+  );
 
-  // Copy over the expected sequence bias models
-  if (seqBiasCorrect) {
-    readExp.setReadBiasModelExpected(std::move(exp5), salmon::utils::Direction::FORWARD); 
-    readExp.setReadBiasModelExpected(std::move(exp3), salmon::utils::Direction::REVERSE_COMPLEMENT); 
-  }
-  
   sopt.jointLog->info("processed bias for 100.0% of the transcripts");
   return effLensOut;
 }
@@ -2125,6 +3073,12 @@ void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm,
   using std::move;
   using std::cerr;
   using std::max;
+
+  auto logger = spdlog::get("jointLog");
+
+  logger->info("NOTE: We recommend using tximport (https://bioconductor.org/packages/release/bioc/html/tximport.html) "
+               "for aggregating transcript-level salmon abundance estimates to the gene level.  It is more versatile, "
+               "exposes more features, and allows considering multi-sample information during aggregation.");
 
   constexpr double minTPM = std::numeric_limits<double>::denorm_min();
   std::ifstream expFile(inputPath.string());
@@ -2141,9 +3095,6 @@ void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm,
 
   bool headerLine{true};
   while (getline(expFile, l)) {
-    if (++ln % 1000 == 0) {
-      cerr << "\r\rParsed " << ln << " expression lines";
-    }
     auto it =
         find_if(l.begin(), l.end(), [](char c) -> bool { return !isspace(c); });
     if (it != l.end()) {
@@ -2154,7 +3105,14 @@ void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm,
         if (!headerLine) {
           vector<string> toks = split(l);
           ExpressionRecord er(toks);
-          auto gn = tgm.geneName(er.target);
+          bool foundGene{false};
+          auto gn = tgm.geneName(er.target, foundGene);
+          if (!foundGene) {
+            logger->warn("couldn't find transcript named [{}] in transcript "
+                         "<-> gene map; "
+                         "returning transcript as it's own gene",
+                         er.target);
+          }
           geneExps[gn].push_back(move(er));
         } else { // treat the header line as a comment
           comments.push_back(l);
@@ -2163,10 +3121,9 @@ void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm,
       }
     }
   }
-  cerr << "\ndone\n";
   expFile.close();
 
-  cerr << "Aggregating expressions to gene level . . .";
+  logger->info("Aggregating expressions to gene level");
   boost::filesystem::path outputFilePath(inputPath);
   outputFilePath.replace_extension(".genes.sf");
   ofstream outFile(outputFilePath.string());
@@ -2185,15 +3142,14 @@ void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm,
     const size_t NE{expVals.size()};
 
     size_t tpmIdx{0};
-    double totalTPM{0.0};
     for (auto& tranExp : kv.second) {
       // expVals[0] = TPM
       // expVals[1] = count
       for (size_t i = 0; i < NE; ++i) {
         expVals[i] += tranExp.expVals[i];
       }
-      totalTPM += expVals[tpmIdx];
     }
+    double totalTPM = expVals[tpmIdx];
 
     // If this gene was expressed
     if (totalTPM > minTPM) {
@@ -2225,20 +3181,22 @@ void aggregateEstimatesToGeneLevel(TranscriptGeneMap& tgm,
   }
 
   outFile.close();
-  cerr << " done\n";
+  logger->info("done");
   //====================== From GeneSum =====================
 }
 
 void generateGeneLevelEstimates(boost::filesystem::path& geneMapPath,
                                 boost::filesystem::path& estDir) {
   namespace bfs = boost::filesystem;
-  std::cerr << "Computing gene-level abundance estimates\n";
-  bfs::path gtfExtension(".gtf");
+  auto logger = spdlog::get("jointLog");
+  logger->info("Computing gene-level abundance estimates");
+  std::set<std::string> validGTFExtensions = {".gtf", ".gff", ".gff3",
+                                              ".GTF", ".GFF", ".GFF3"};
   auto extension = geneMapPath.extension();
 
   TranscriptGeneMap tranGeneMap;
   // parse the map as a GTF file
-  if (extension == gtfExtension) {
+  if (validGTFExtensions.find(extension.string()) != validGTFExtensions.end()) {
     // Using libgff
     tranGeneMap = salmon::utils::transcriptGeneMapFromGTF(geneMapPath.string(),
                                                           "gene_id");
@@ -2248,9 +3206,8 @@ void generateGeneLevelEstimates(boost::filesystem::path& geneMapPath,
     tgfile.close();
   }
 
-  std::cerr << "There were " << tranGeneMap.numTranscripts()
-            << " transcripts mapping to " << tranGeneMap.numGenes()
-            << " genes\n";
+  logger->info("There were {} transcripts mapping to {} genes",
+               tranGeneMap.numTranscripts(), tranGeneMap.numGenes());
 
   bfs::path estFilePath = estDir / "quant.sf";
   if (!bfs::exists(estFilePath)) {
@@ -2281,44 +3238,76 @@ void generateGeneLevelEstimates(boost::filesystem::path& geneMapPath,
   }
   */
 }
+
+double compute_1_edit_threshold(int32_t l, const SalmonOpts& sopt) {
+  int32_t match = sopt.matchScore;
+  int32_t mismatch = (sopt.mismatchPenalty < 0) ? sopt.mismatchPenalty : -sopt.mismatchPenalty;
+  int32_t go = (sopt.gapOpenPenalty < 0) ? sopt.gapOpenPenalty : -sopt.gapOpenPenalty;
+  int32_t ge = (sopt.gapExtendPenalty < 0) ? sopt.gapExtendPenalty : -sopt.gapExtendPenalty;
+
+  // cost of subst = mismatch - cost of losing a match
+  // cost of deletion = gap open + gap extend - cost of losing a match
+  int32_t edit_cost = std::min(mismatch - match, go + ge - match);
+  int32_t max_score = l * match;
+  return  (static_cast<double>(max_score + edit_cost) - 0.5) / max_score;
 }
-}
+
+} // namespace utils
+} // namespace salmon
 
 // === Explicit instantiations
+using SCExpT = ReadExperiment<EquivalenceClassBuilder<SCTGValue>>;
+using BulkExpT = ReadExperiment<EquivalenceClassBuilder<TGValue>>;
+template <typename FragT>
+using BulkAlignLibT = AlignmentLibrary<FragT, EquivalenceClassBuilder<TGValue>>;
 
 // explicit instantiations for writing abundances ---
-template void salmon::utils::writeAbundances<AlignmentLibrary<ReadPair>>(
-    const SalmonOpts& opts, AlignmentLibrary<ReadPair>& alnLib,
+template void salmon::utils::writeAbundances<BulkAlignLibT<ReadPair>>(
+    const SalmonOpts& opts, BulkAlignLibT<ReadPair>& alnLib,
     boost::filesystem::path& fname, std::string headerComments);
 
-template void salmon::utils::writeAbundances<AlignmentLibrary<UnpairedRead>>(
-    const SalmonOpts& opts, AlignmentLibrary<UnpairedRead>& alnLib,
+template void salmon::utils::writeAbundances<BulkAlignLibT<UnpairedRead>>(
+    const SalmonOpts& opts, BulkAlignLibT<UnpairedRead>& alnLib,
     boost::filesystem::path& fname, std::string headerComments);
-template void salmon::utils::writeAbundances<ReadExperiment>(
-    const SalmonOpts& opts, ReadExperiment& alnLib,
+
+template void salmon::utils::writeAbundances<BulkExpT>(
+    const SalmonOpts& opts, BulkExpT& alnLib,
     boost::filesystem::path& fname, std::string headerComments);
+
+template void salmon::utils::writeAbundances<SCExpT>(
+                                                             const SalmonOpts& opts, SCExpT& alnLib,
+                                                             boost::filesystem::path& fname, std::string headerComments);
+
+
 template void
-salmon::utils::writeAbundancesFromCollapsed<AlignmentLibrary<ReadPair>>(
-    const SalmonOpts& opts, AlignmentLibrary<ReadPair>& alnLib,
+salmon::utils::writeAbundancesFromCollapsed<BulkAlignLibT<ReadPair>>(
+    const SalmonOpts& opts, BulkAlignLibT<ReadPair>& alnLib,
     boost::filesystem::path& fname, std::string headerComments);
 
 template void
-salmon::utils::writeAbundancesFromCollapsed<AlignmentLibrary<UnpairedRead>>(
-    const SalmonOpts& opts, AlignmentLibrary<UnpairedRead>& alnLib,
-    boost::filesystem::path& fname, std::string headerComments);
-template void salmon::utils::writeAbundancesFromCollapsed<ReadExperiment>(
-    const SalmonOpts& opts, ReadExperiment& alnLib,
+salmon::utils::writeAbundancesFromCollapsed<BulkAlignLibT<UnpairedRead>>(
+    const SalmonOpts& opts, BulkAlignLibT<UnpairedRead>& alnLib,
     boost::filesystem::path& fname, std::string headerComments);
 
+template void salmon::utils::writeAbundancesFromCollapsed<BulkExpT>(
+    const SalmonOpts& opts, BulkExpT& alnLib,
+    boost::filesystem::path& fname, std::string headerComments);
+
+template void salmon::utils::writeAbundancesFromCollapsed<SCExpT>(
+                                                                          const SalmonOpts& opts, SCExpT& alnLib,
+                                                                          boost::filesystem::path& fname, std::string headerComments);
 // explicit instantiations for normalizing alpha vectors ---
 template void
-salmon::utils::normalizeAlphas<ReadExperiment>(const SalmonOpts& sopt,
-                                               ReadExperiment& alnLib);
+salmon::utils::normalizeAlphas<BulkExpT>(const SalmonOpts& sopt,
+                                               BulkExpT& alnLib);
+template void
+salmon::utils::normalizeAlphas<SCExpT>(const SalmonOpts& sopt,
+                                               SCExpT& alnLib);
 
-template void salmon::utils::normalizeAlphas<AlignmentLibrary<UnpairedRead>>(
-    const SalmonOpts& sopt, AlignmentLibrary<UnpairedRead>& alnLib);
-template void salmon::utils::normalizeAlphas<AlignmentLibrary<ReadPair>>(
-    const SalmonOpts& sopt, AlignmentLibrary<ReadPair>& alnLib);
+template void salmon::utils::normalizeAlphas<BulkAlignLibT<UnpairedRead>>(
+    const SalmonOpts& sopt, BulkAlignLibT<UnpairedRead>& alnLib);
+template void salmon::utils::normalizeAlphas<BulkAlignLibT<ReadPair>>(
+    const SalmonOpts& sopt, BulkAlignLibT<ReadPair>& alnLib);
 
 // explicit instantiations for effective length updates ---
 /*
@@ -2363,40 +3352,55 @@ salmon::utils::updateEffectiveLengths<std::vector<double>,
 // explicit instantiations for effective length updates ---
 template Eigen::VectorXd
 salmon::utils::updateEffectiveLengths<std::vector<tbb::atomic<double>>,
-                                      ReadExperiment>(
-    SalmonOpts& sopt, ReadExperiment& readExp, Eigen::VectorXd& effLensIn,
-    std::vector<tbb::atomic<double>>& alphas, bool finalRound);
-
-template Eigen::VectorXd
-salmon::utils::updateEffectiveLengths<std::vector<double>, ReadExperiment>(
-    SalmonOpts& sopt, ReadExperiment& readExp, Eigen::VectorXd& effLensIn,
-    std::vector<double>& alphas, bool finalRound);
-
-template Eigen::VectorXd
-salmon::utils::updateEffectiveLengths<std::vector<tbb::atomic<double>>,
-                                      AlignmentLibrary<ReadPair>>(
-    SalmonOpts& sopt, AlignmentLibrary<ReadPair>& readExp,
-    Eigen::VectorXd& effLensIn, std::vector<tbb::atomic<double>>& alphas,
+                                      BulkExpT>(
+    SalmonOpts& sopt, BulkExpT& readExp, Eigen::VectorXd& effLensIn,
+    std::vector<tbb::atomic<double>>& alphas, std::vector<bool>& available,
     bool finalRound);
 
 template Eigen::VectorXd
-salmon::utils::updateEffectiveLengths<std::vector<double>,
-                                      AlignmentLibrary<ReadPair>>(
-    SalmonOpts& sopt, AlignmentLibrary<ReadPair>& readExp,
-    Eigen::VectorXd& effLensIn, std::vector<double>& alphas, bool finalRound);
+salmon::utils::updateEffectiveLengths<std::vector<tbb::atomic<double>>,
+                                      SCExpT>(
+                                                      SalmonOpts& sopt, SCExpT& readExp, Eigen::VectorXd& effLensIn,
+                                                      std::vector<tbb::atomic<double>>& alphas, std::vector<bool>& available,
+                                                      bool finalRound);
+
+template Eigen::VectorXd
+salmon::utils::updateEffectiveLengths<std::vector<double>, BulkExpT>(
+    SalmonOpts& sopt, BulkExpT& readExp, Eigen::VectorXd& effLensIn,
+    std::vector<double>& alphas, std::vector<bool>& available, bool finalRound);
+
+template Eigen::VectorXd
+salmon::utils::updateEffectiveLengths<std::vector<double>, SCExpT>(
+                                                                           SalmonOpts& sopt, SCExpT& readExp, Eigen::VectorXd& effLensIn,
+                                                                           std::vector<double>& alphas, std::vector<bool>& available, bool finalRound);
 
 template Eigen::VectorXd
 salmon::utils::updateEffectiveLengths<std::vector<tbb::atomic<double>>,
-                                      AlignmentLibrary<UnpairedRead>>(
-    SalmonOpts& sopt, AlignmentLibrary<UnpairedRead>& readExp,
+                                      BulkAlignLibT<ReadPair>>(
+    SalmonOpts& sopt, BulkAlignLibT<ReadPair>& readExp,
     Eigen::VectorXd& effLensIn, std::vector<tbb::atomic<double>>& alphas,
-    bool finalRound);
+    std::vector<bool>& available, bool finalRound);
 
 template Eigen::VectorXd
 salmon::utils::updateEffectiveLengths<std::vector<double>,
-                                      AlignmentLibrary<UnpairedRead>>(
-    SalmonOpts& sopt, AlignmentLibrary<UnpairedRead>& readExp,
-    Eigen::VectorXd& effLensIn, std::vector<double>& alphas, bool finalRound);
+                                      BulkAlignLibT<ReadPair>>(
+    SalmonOpts& sopt, BulkAlignLibT<ReadPair>& readExp,
+    Eigen::VectorXd& effLensIn, std::vector<double>& alphas,
+    std::vector<bool>& available, bool finalRound);
+
+template Eigen::VectorXd
+salmon::utils::updateEffectiveLengths<std::vector<tbb::atomic<double>>,
+                                      BulkAlignLibT<UnpairedRead>>(
+    SalmonOpts& sopt, BulkAlignLibT<UnpairedRead>& readExp,
+    Eigen::VectorXd& effLensIn, std::vector<tbb::atomic<double>>& alphas,
+    std::vector<bool>& available, bool finalRound);
+
+template Eigen::VectorXd
+salmon::utils::updateEffectiveLengths<std::vector<double>,
+                                      BulkAlignLibT<UnpairedRead>>(
+    SalmonOpts& sopt, BulkAlignLibT<UnpairedRead>& readExp,
+    Eigen::VectorXd& effLensIn, std::vector<double>& alphas,
+    std::vector<bool>& available, bool finalRound);
 
 //// 0th order model --- code for computing bias factors.
 
