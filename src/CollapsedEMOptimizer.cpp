@@ -1127,7 +1127,7 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
       if (alphasPrime[i] > alphaCheckCutoff) {
         double relDiff = std::abs(alphas[i] - alphasPrime[i]) / alphasPrime[i];
         maxRelDiff = (relDiff > maxRelDiff) ? relDiff : maxRelDiff;
-        if (relDiff > 0.02) { //relDiffTolerance) {
+        if (relDiff > relDiffTolerance) {
           converged = false;
         }
       }
