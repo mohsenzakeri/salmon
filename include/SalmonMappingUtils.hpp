@@ -244,6 +244,7 @@ inline void filterAndCollectAlignments(
     auto& jointHit = jointHits[ctr];
 
     double currScore = scores[ctr];
+    double perfectScoreD = singleEnd or jointHit.isOrphan() ? readLen * 2.0 : (readLen + mateLen) * 2.0;
     double v = bestScoreD - currScore;
     // why -1?
     double estAlnProb = hardFilter ? -1.0 : std::exp(- scoreExp * v );

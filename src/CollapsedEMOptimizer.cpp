@@ -370,7 +370,7 @@ void EMUpdate_FM(EQVecT& eqVec,
                     double local_mean = 0;                                                                        
                     double k = 1;                       
                     double kk = 0;                                                                                                                                                                                                   
-                    for(k = std::max(0, (int)bucket_pos + j - 10); k < std::min(transcripts[tid].read_coverage.size() , bucket_pos + j + 11); ++k) {
+                    for(k = std::max(0, (int)bucket_pos + j - 2); k < std::min(transcripts[tid].read_coverage.size() , bucket_pos + j + 3); ++k) {
                       kk += 1;
                       local_mean += transcripts[tid].read_coverage[k];
                       //std::cerr<<transcripts[tid].read_coverage[k]<<" ";
@@ -388,7 +388,7 @@ void EMUpdate_FM(EQVecT& eqVec,
                   all_diffs = 0.5*all_diffs/(double)bucket_count;
                   if (alphaIn[tid] < 0.01 )
                     all_diffs = 0.5;
-                  coverage_score = 0.5 - std::pow(all_diffs, 3);
+                  coverage_score = 0.5 - std::pow(all_diffs, 1);
                   //std::cerr<<"score:"<< bucket_count<< " " << all_diffs<< " "<< coverage_score<<"\n";
                   coverage.push_back(coverage_score);
                 }
@@ -1054,46 +1054,48 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
 
     //Update the coverage buckets
     //clear the buckets
-    for (size_t i = 0; i < transcripts.size(); ++i) {
-    	size_t bucket_count = transcripts[i].read_coverage.size();
-			for(int j = 0; j < bucket_count; ++j) {
-			  transcripts[i].read_coverage[j] = 0;
+    if (useFMEM) {
+			for (size_t i = 0; i < transcripts.size(); ++i) {
+				size_t bucket_count = transcripts[i].read_coverage.size();
+				for(int j = 0; j < bucket_count; ++j) {
+					transcripts[i].read_coverage[j] = 0;
+				}
 			}
-    }
-    //add the reads to the buckets
+			//add the reads to the buckets
 
-    //if (itNum % 50 == 0)
-    tbb::parallel_for(
-    BlockedIndexRange(size_t(0), size_t(eqVec.size())),
-    [&eqVec, &transcripts, &sopt](const BlockedIndexRange& range) -> void {
-    // For each index in the equivalence class vector
-    for (auto eqID : boost::irange(range.begin(), range.end())) {
-      auto& kv = eqVec[eqID];
-      uint64_t count = kv.second.count;
-      // for each transcript in this class
-      const TranscriptGroup& tgroup = kv.first;
-      //The FULL MODEL
-      if (tgroup.valid) {                                                                
-        const std::vector<uint32_t>& txps = tgroup.txps;
-        size_t groupSize = kv.second.weights.size(); 
-        //for (size_t i = 0; i < groupSize; ++i) { if (txps[i] == ttid) std::cerr<<"!\n";  }
-        size_t  allWeights_iter = 0;         
-        for (size_t f = 0; f< count; ++f) {
-          for (size_t i = 0; i < groupSize; ++i) {
-            auto tid = txps[i];
-            int32_t position = kv.second.startPositions[i + allWeights_iter];
-            size_t bucket_pos = position/sopt.bucket_size;
-            if(transcripts[tid].read_coverage.size()-1 < bucket_pos) std::cerr<<transcripts[tid].read_coverage.size()-1<<" " << bucket_pos <<"\n";
-            size_t bucket_count = kv.second.fragmentLengths[i + allWeights_iter]/sopt.bucket_size+1.0;
-            for(int j = 0; j < bucket_count; ++j) {
-              salmon::utils::incLoop(transcripts[tid].read_coverage[bucket_pos + j], kv.second.assignedWeights[i + allWeights_iter]);
-            }
-          }
-          allWeights_iter+=groupSize;
-        }
-      }
+			//if (itNum % 50 == 0)
+			tbb::parallel_for(
+			BlockedIndexRange(size_t(0), size_t(eqVec.size())),
+			[&eqVec, &transcripts, &sopt](const BlockedIndexRange& range) -> void {
+			// For each index in the equivalence class vector
+			for (auto eqID : boost::irange(range.begin(), range.end())) {
+				auto& kv = eqVec[eqID];
+				uint64_t count = kv.second.count;
+				// for each transcript in this class
+				const TranscriptGroup& tgroup = kv.first;
+				//The FULL MODEL
+				if (tgroup.valid) {                                                                
+					const std::vector<uint32_t>& txps = tgroup.txps;
+					size_t groupSize = kv.second.weights.size(); 
+					//for (size_t i = 0; i < groupSize; ++i) { if (txps[i] == ttid) std::cerr<<"!\n";  }
+					size_t  allWeights_iter = 0;         
+					for (size_t f = 0; f< count; ++f) {
+						for (size_t i = 0; i < groupSize; ++i) {
+							auto tid = txps[i];
+							int32_t position = kv.second.startPositions[i + allWeights_iter];
+							size_t bucket_pos = (position)/sopt.bucket_size;
+							if(transcripts[tid].read_coverage.size() < bucket_pos) std::cerr<<transcripts[tid].read_coverage.size()-1<<" " << bucket_pos <<"\n";
+							size_t bucket_count = kv.second.fragmentLengths[i + allWeights_iter]/sopt.bucket_size;
+							for(int j = 0; j < bucket_count; ++j) {
+								salmon::utils::incLoop(transcripts[tid].read_coverage[bucket_pos + j], kv.second.assignedWeights[i + allWeights_iter]);
+							}
+						}
+						allWeights_iter+=groupSize;
+					}
+				}
+			}
+			});
     }
-    });
 
     if (useFMEM) {
       EMUpdate_FM(eqVec, transcripts, alphas, alphasPrime, sopt.bucket_size, 38197, itNum);
@@ -1116,14 +1118,14 @@ bool CollapsedEMOptimizer::optimize(ExpT& readExp, SalmonOpts& sopt,
     maxRelDiff = -std::numeric_limits<double>::max();
     for (size_t i = 0; i < transcripts.size(); ++i) {
       //if (transcripts[i].RefName == "ENST00000488147.1_t3|ENSG00000227232.5|OTTHUMG00000000958.1|OTTHUMT00000002839.1|WASH7P-201|WASH7P|1351|unprocessed_pseudogene|" and itNum % 100 == 0) {
-      /*if (transcripts[i].RefName == "ENST00000488147.1|ENSG00000227232.5|OTTHUMG00000000958.1|OTTHUMT00000002839.1|WASH7P-201|WASH7P|1351|unprocessed_pseudogene|" and itNum % 100 == 0) {
+      if ( (transcripts[i].RefName == "snR40_genomic" or transcripts[i].RefName == "snR40") and itNum % 10 == 0) {
 								size_t bucket_count = transcripts[i].read_coverage.size();
 								for(int j = 0; j < bucket_count; ++j) {
 									double bucket_reads = transcripts[i].read_coverage[j];
 									std::cerr<<bucket_reads<< " ";
 								}
 								std::cerr<<"\n";
-		  }*/
+		  }
       if (alphasPrime[i] > alphaCheckCutoff) {
         double relDiff = std::abs(alphas[i] - alphasPrime[i]) / alphasPrime[i];
         maxRelDiff = (relDiff > maxRelDiff) ? relDiff : maxRelDiff;
